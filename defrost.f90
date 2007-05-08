@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 1.3 2007/05/05 06:51:48 frolov Exp $
+! $Id: defrost.f90,v 1.4 2007/05/08 22:59:05 frolov Exp $
 ! [compile with: ifc -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -15,7 +15,7 @@ real, parameter :: twopi = 6.2831853071795864769252867665590
 real, parameter :: sqrt3 = 1.7320508075688772935274463415059
 
 ! control parameters
-integer, parameter :: n = 256                   ! grid size: spatial grid contains n^3 points
+integer, parameter :: n = 32                    ! grid size: spatial grid contains n^3 points
 integer, parameter :: p = n+2                   ! padded grid size (adjust for cache efficiency)
 integer, parameter :: nn = n/2+1                ! Nyquist frequency
 integer, parameter :: ns = sqrt3*(n/2) + 2      ! ...
@@ -28,6 +28,7 @@ real, parameter :: dx = 1.0/n, dt = dx/alpha
 
 
 integer l
+integer i,j,k
 
 ! smp array samples all fields on a 3D grid for three subsequent time slices
 integer, parameter :: phi = 1, psi = 2, fields = 2; real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n)
@@ -35,17 +36,22 @@ integer, parameter :: phi = 1, psi = 2, fields = 2; real smp(fields,0:p,0:p,0:p,
 ! for larger grids, dynamically allocated array might be required
 ! real, allocatable :: smp(:,:,:,:,:), tmp(:,:,:); allocate(smp(fields,0:p,0:p,0:p,3), tmp(n,n,n))
 
+! use threaded FFTW on SMP machines (link with -lfftw3_threads)
+!call dfftw_init_threads
+!call dfftw_plan_with_nthreads(4)
+
 smp = 0.0
 smp(1,n/2,n/2,n/2,:) = 1.0
+!forall (i=1:n,j=1:n,k=1:n) smp(1,i,j,k,:) = exp(-((i-nn)**2 + (j-nn)**2 + (k-nn)**2)*(dx/0.1)**2)
 
 !tmp = smp(1,1:n,1:n,1:n,1)
-call sample(tmp, 1.0)
-call dump("pHi", 1, (1-1)*dt, tmp)
+!call sample(tmp, 1.0)
+!call dump("pHi", 1, (1-1)*dt, tmp)
 
-do l = 1,10,3
-        !call step(l,   smp(:,:,:,:,1), smp(:,:,:,:,2), smp(:,:,:,:,3))
-        !call step(l+1, smp(:,:,:,:,2), smp(:,:,:,:,3), smp(:,:,:,:,1))
-        !call step(l+2, smp(:,:,:,:,3), smp(:,:,:,:,1), smp(:,:,:,:,2))
+do l = 1,10000,3
+        call step(l,   smp(:,:,:,:,1), smp(:,:,:,:,2), smp(:,:,:,:,3))
+        call step(l+1, smp(:,:,:,:,2), smp(:,:,:,:,3), smp(:,:,:,:,1))
+        call step(l+2, smp(:,:,:,:,3), smp(:,:,:,:,1), smp(:,:,:,:,2))
 end do
 
 contains
@@ -55,14 +61,27 @@ contains
 
 ! scalar field evolution step
 subroutine step(l, dn, hr, up)
-        real, dimension(fields,0:p,0:p,0:p) :: dn, hr, up; integer i, j, k, l
+        real, dimension(fields,0:p,0:p,0:p) :: dn, hr, up
+        real, dimension(n) :: V, T, G, PE, KE, GE
+        integer i, j, k, l; logical output
         
-        real, parameter :: c3 = 0.0, c2 = 0.0, c1 = 1.0, c0 = -6.0, cc = 1.0
+        ! ... these will move ...
+        real, parameter :: a = 1.0, H = 0.0
+        real, parameter :: m2phi = 1.0, m2psi = 0.0, g2 = 1.0
+        
+        ! Laplacian operator stencils: traditional one and three isotropic variants
+        ! stable for dx/dt > sqrt(3), sqrt(2), sqrt(21)/3, and 8/sqrt(30) respectively
+        ! computational cost difference is insignificant for large grids
+        
+        !real, parameter :: c3 = 0.0, c2 = 0.0, c1 = 1.0, c0 = -6.0, cc = 1.0
         !real, parameter :: c3 = 0.0, c2 = 1.0, c1 = 2.0, c0 = -24.0, cc = 6.0
         !real, parameter :: c3 = 1.0, c2 = 0.0, c1 = 8.0, c0 = -56.0, cc = 12.0
-        !real, parameter :: c3 = 1.0, c2 = 3.0, c1 = 14.0, c0 = -128.0, cc = 30.0
+        real, parameter :: c3 = 1.0, c2 = 3.0, c1 = 14.0, c0 = -128.0, cc = 30.0
         
-        real, parameter :: a = c0 + 2.0 * alpha**2 * cc, c = alpha**2 * cc
+        real, parameter :: c = cc * alpha**2 * a**2, b = c0 + 2.0*c
+        
+        PE = 0.0; KE = 0.0; GE = 0.0
+        output = mod(l-1, n/nt) == 0
         
         do k = 1,n; do j = 1,n; do i = 1,n
                 up(:,i,j,k) = (                                                                                              &
@@ -72,18 +91,42 @@ subroutine step(l, dn, hr, up)
                          + hr(:,i,j-1,k-1) + hr(:,i,j+1,k-1) + hr(:,i,j-1,k+1) + hr(:,i,j+1,k+1) ) +                         &
                     c3 * ( hr(:,i-1,j-1,k-1) + hr(:,i+1,j-1,k-1) + hr(:,i-1,j+1,k-1) + hr(:,i+1,j+1,k-1)                     &
                          + hr(:,i-1,j-1,k+1) + hr(:,i+1,j-1,k+1) + hr(:,i-1,j+1,k+1) + hr(:,i+1,j+1,k+1) ) +                 &
-                    a * hr(:,i,j,k) )/c - dn(:,i,j,k)
+                    b * hr(:,i,j,k) )/c - dn(:,i,j,k)*(1.0-(1.5*dt)*H)
                 
-                up(phi,i,j,k) = up(phi,i,j,k) - (1.0 + hr(psi,i,j,k)**2) * hr(phi,i,j,k) * dt**2
-                up(psi,i,j,k) = up(psi,i,j,k) - (2.0 + hr(phi,i,j,k)**2) * hr(psi,i,j,k) * dt**2
+                ! scalar field potential derivatives are inlined here
+                up(phi,i,j,k) = (up(phi,i,j,k) - (m2phi + g2*hr(psi,i,j,k)**2) * hr(phi,i,j,k) * dt**2)/(1.0+(1.5*dt)*H)
+                up(psi,i,j,k) = (up(psi,i,j,k) - (m2psi + g2*hr(phi,i,j,k)**2) * hr(psi,i,j,k) * dt**2)/(1.0+(1.5*dt)*H)
+                
+                ! scalar field potential multiplied by 2 is inlined here
+                V(k) = (m2phi + g2*hr(psi,i,j,k)**2)*hr(phi,i,j,k)**2 + m2psi*hr(psi,i,j,k)**2
+                T(k) = sum((up(:,i,j,k)-dn(:,i,j,k))**2)
+                
+                PE(k) = PE(k) + V(k); KE(k) = KE(k) + T(k)
+                
+                ! calculate density and pressure when needed
+                if (output) then
+                        G(k) = sum( (hr(:,i+1,j,k)-hr(:,i-1,j,k))**2 &
+                                  + (hr(:,i,j+1,k)-hr(:,i,j-1,k))**2 &
+                                  + (hr(:,i,j,k+1)-hr(:,i,j,k-1))**2 )
+                        dn(phi,i,j,k) = T(k)/(8.0*dt**2) + G(k)/( 8.0*(a*dx)**2) + V(k)/2.0
+                        dn(psi,i,j,k) = T(k)/(8.0*dt**2) - G(k)/(24.0*(a*dx)**2) - V(k)/2.0
+                        
+                        GE(k) = GE(k) + G(k)
+                end if
         end do; end do; end do
         
+        ! periodic boundary conditions
         up(:,0,:,:) = up(:,n,:,:); up(:,n+1,:,:) = up(:,1,:,:)
         up(:,:,0,:) = up(:,:,n,:); up(:,:,n+1,:) = up(:,:,1,:)
         up(:,:,:,0) = up(:,:,:,n); up(:,:,:,n+1) = up(:,:,:,1)
         
-        ! ...
-        ! if (mod(l-1, n/nt) == 0) then; tmp = hr(phi,1:n,1:n,1:n); call dump("pHi", (l-1)/(n/nt), (l-1)*dt, tmp); end if
+        ! dump simulation data
+        if (output) then
+                tmp = hr(phi,1:n,1:n,1:n); call dump("phi", (l-1)/(n/nt), (l-1)*dt, tmp)
+                tmp = hr(psi,1:n,1:n,1:n); call dump("psi", (l-1)/(n/nt), (l-1)*dt, tmp)
+                tmp = dn(phi,1:n,1:n,1:n); call dump("rho", (l-1)/(n/nt), (l-1)*dt, tmp)
+                tmp = dn(psi,1:n,1:n,1:n); call dump("p",   (l-1)/(n/nt), (l-1)*dt, tmp)
+        end if
 end subroutine step
 
 
@@ -123,10 +166,13 @@ subroutine laplace(f, rho)
         
         real, parameter :: w = twopi/n
         
-        real, parameter :: c3 = 0.0, c2 = 0.0, c1 = 1.0, c0 = -3.0, cc = 0.5
+        ! Laplacian operator stencils: traditional one and three isotropic variants
+        ! (corresponding to discretization used for field evolution equations above)
+        
+        !real, parameter :: c3 = 0.0, c2 = 0.0, c1 = 1.0, c0 = -3.0, cc = 0.5
         !real, parameter :: c3 = 0.0, c2 = 1.0, c1 = 1.0, c0 = -6.0, cc = 1.5
         !real, parameter :: c3 = 1.0, c2 = 0.0, c1 = 2.0, c0 = -7.0, cc = 1.5
-        !real, parameter :: c3 = 2.0, c2 = 3.0, c1 = 7.0, c0 = -32.0, cc = 7.5
+        real, parameter :: c3 = 2.0, c2 = 3.0, c1 = 7.0, c0 = -32.0, cc = 7.5
         
         real, parameter :: c = cc * dx**2/real(n)**3
         
@@ -160,7 +206,6 @@ subroutine spectrum(f, S)
         do i = 1,n; if (i <= nn) then; ii = i-1; else; ii = n+1-i; end if
                 p = sqrt(real(ii**2 + jj**2 + kk**2)); l = floor(p)
                 
-                !c = (/ 1.0, 0.0 /)
                 c = (1.0 - (/l-p,l+1-p/)**2)**2
                 
                 S(l+1:l+2) = S(l+1:l+2) + c * Fk(ii+1,j,k)*conjg(Fk(ii+1,j,k))
@@ -210,6 +255,8 @@ subroutine dump(file, frame, t, f)
         integer, parameter :: stride = n/nx
         real, parameter :: dk = twopi/(n*dx)
         
+        return
+        
         write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.ult'; open(12, file=buffer)
         write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.bov'; open(10, file=buffer)
         write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.raw'; open(11, file=buffer, form="binary")
@@ -226,7 +273,7 @@ subroutine dump(file, frame, t, f)
         write (10,'(4g)') "CENTERING:       ", "zonal"
         
         ! raw data
-        if (stride > 1) then; write (11) f(::stride,::stride,::stride); else; write (11) f; end if
+        if (stride > 1) then; do k=1,n,stride; write (11) f(::stride,::stride,k); end do; else; write (11) f; end if
         
         ! power spectrum
         call spectrum(f, S)
