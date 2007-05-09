@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 1.4 2007/05/08 22:59:05 frolov Exp $
+! $Id: defrost.f90,v 1.5 2007/05/09 03:53:15 frolov Exp $
 ! [compile with: ifc -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -78,24 +78,29 @@ subroutine step(l, dn, hr, up)
         !real, parameter :: c3 = 1.0, c2 = 0.0, c1 = 8.0, c0 = -56.0, cc = 12.0
         real, parameter :: c3 = 1.0, c2 = 3.0, c1 = 14.0, c0 = -128.0, cc = 30.0
         
-        real, parameter :: c = cc * alpha**2 * a**2, b = c0 + 2.0*c
+        ! all coefficients inside the loop are pre-calculated
+        real, parameter :: c = cc * alpha**2 * a**2
+        real, parameter :: b0 = 2.0 + c0/c, b1 = c1/c, b2 = c2/c, b3 = c3/c
+        real, parameter :: d1 = 1.0 - 1.5*H*dt, d2 = 1.0/(1.0 + 1.5*H*dt)
+        real, parameter :: e1 = 1.0/(8.0*dt**2), e2 = 1.0/(8.0*(a*dx)**2), e3 = e2/3.0
         
         PE = 0.0; KE = 0.0; GE = 0.0
         output = mod(l-1, n/nt) == 0
         
         do k = 1,n; do j = 1,n; do i = 1,n
-                up(:,i,j,k) = (                                                                                              &
-                    c1 * ( hr(:,i-1,j,k) + hr(:,i+1,j,k) + hr(:,i,j-1,k) + hr(:,i,j+1,k) + hr(:,i,j,k-1) + hr(:,i,j,k+1) ) + &
-                    c2 * ( hr(:,i-1,j-1,k) + hr(:,i+1,j-1,k) + hr(:,i-1,j+1,k) + hr(:,i+1,j+1,k)                             &
+                up(:,i,j,k) =                                                                                                &
+                    b0 * hr(:,i,j,k) +                                                                                       &
+                    b1 * ( hr(:,i-1,j,k) + hr(:,i+1,j,k) + hr(:,i,j-1,k) + hr(:,i,j+1,k) + hr(:,i,j,k-1) + hr(:,i,j,k+1) ) + &
+                    b2 * ( hr(:,i-1,j-1,k) + hr(:,i+1,j-1,k) + hr(:,i-1,j+1,k) + hr(:,i+1,j+1,k)                             &
                          + hr(:,i-1,j,k-1) + hr(:,i+1,j,k-1) + hr(:,i-1,j,k+1) + hr(:,i+1,j,k+1)                             &
                          + hr(:,i,j-1,k-1) + hr(:,i,j+1,k-1) + hr(:,i,j-1,k+1) + hr(:,i,j+1,k+1) ) +                         &
-                    c3 * ( hr(:,i-1,j-1,k-1) + hr(:,i+1,j-1,k-1) + hr(:,i-1,j+1,k-1) + hr(:,i+1,j+1,k-1)                     &
-                         + hr(:,i-1,j-1,k+1) + hr(:,i+1,j-1,k+1) + hr(:,i-1,j+1,k+1) + hr(:,i+1,j+1,k+1) ) +                 &
-                    b * hr(:,i,j,k) )/c - dn(:,i,j,k)*(1.0-(1.5*dt)*H)
+                    b3 * ( hr(:,i-1,j-1,k-1) + hr(:,i+1,j-1,k-1) + hr(:,i-1,j+1,k-1) + hr(:,i+1,j+1,k-1)                     &
+                         + hr(:,i-1,j-1,k+1) + hr(:,i+1,j-1,k+1) + hr(:,i-1,j+1,k+1) + hr(:,i+1,j+1,k+1) ) -                 &
+                    d1 * dn(:,i,j,k)
                 
                 ! scalar field potential derivatives are inlined here
-                up(phi,i,j,k) = (up(phi,i,j,k) - (m2phi + g2*hr(psi,i,j,k)**2) * hr(phi,i,j,k) * dt**2)/(1.0+(1.5*dt)*H)
-                up(psi,i,j,k) = (up(psi,i,j,k) - (m2psi + g2*hr(phi,i,j,k)**2) * hr(psi,i,j,k) * dt**2)/(1.0+(1.5*dt)*H)
+                up(phi,i,j,k) = d2 * (up(phi,i,j,k) - (m2phi + g2*hr(psi,i,j,k)**2) * hr(phi,i,j,k) * dt**2)
+                up(psi,i,j,k) = d2 * (up(psi,i,j,k) - (m2psi + g2*hr(phi,i,j,k)**2) * hr(psi,i,j,k) * dt**2)
                 
                 ! scalar field potential multiplied by 2 is inlined here
                 V(k) = (m2phi + g2*hr(psi,i,j,k)**2)*hr(phi,i,j,k)**2 + m2psi*hr(psi,i,j,k)**2
@@ -108,8 +113,8 @@ subroutine step(l, dn, hr, up)
                         G(k) = sum( (hr(:,i+1,j,k)-hr(:,i-1,j,k))**2 &
                                   + (hr(:,i,j+1,k)-hr(:,i,j-1,k))**2 &
                                   + (hr(:,i,j,k+1)-hr(:,i,j,k-1))**2 )
-                        dn(phi,i,j,k) = T(k)/(8.0*dt**2) + G(k)/( 8.0*(a*dx)**2) + V(k)/2.0
-                        dn(psi,i,j,k) = T(k)/(8.0*dt**2) - G(k)/(24.0*(a*dx)**2) - V(k)/2.0
+                        dn(phi,i,j,k) = e1*T(k) + e2*G(k) + 0.5*V(k)
+                        dn(psi,i,j,k) = e1*T(k) - e3*G(k) - 0.5*V(k)
                         
                         GE(k) = GE(k) + G(k)
                 end if
