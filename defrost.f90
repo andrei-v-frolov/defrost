@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 1.5 2007/05/09 03:53:15 frolov Exp $
+! $Id: defrost.f90,v 1.6 2007/06/05 06:22:59 frolov Exp $
 ! [compile with: ifc -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -26,6 +26,20 @@ integer, parameter :: nx = 32                   ! ...
 real, parameter :: alpha = 2.0
 real, parameter :: dx = 1.0/n, dt = dx/alpha
 
+! ... these will move ...
+real, parameter :: m2phi = 1.0, m2psi = 0.0, g2 = 1.0
+
+! initial conditions for homogeneous field component
+real, parameter ::  phi0 =  1.0093430384226378929425913902459
+real, parameter :: dphi0 = -0.7137133070120812430962278466136
+real, parameter ::    H0 =  0.5046715192113189464712956951230
+real, parameter ::   dH0 = -H0**2
+real, parameter :: ddphi0 = -(3.0*H0*dphi0 + m2phi*phi0)
+real, parameter ::  ddH0 = -dphi0*ddphi0
+
+! scale factor and horizon size (sampled on two subsequent time slices)
+real :: LA(2) = (/ 1.0 - H0*dt, 1.0 /)
+real :: LH(2) = 1.0/(/ H0 - dH0*dt + ddH0*dt**2/2.0, H0 /)
 
 integer l
 integer i,j,k
@@ -41,14 +55,16 @@ integer, parameter :: phi = 1, psi = 2, fields = 2; real smp(fields,0:p,0:p,0:p,
 !call dfftw_plan_with_nthreads(4)
 
 smp = 0.0
-smp(1,n/2,n/2,n/2,:) = 1.0
+!smp(1,n/2,n/2,n/2,:) = 1.0
 !forall (i=1:n,j=1:n,k=1:n) smp(1,i,j,k,:) = exp(-((i-nn)**2 + (j-nn)**2 + (k-nn)**2)*(dx/0.1)**2)
+smp(phi,:,:,:,1) = phi0 - dphi0*dt + ddphi0*dt**2/2.0
+smp(phi,:,:,:,2) = phi0
 
 !tmp = smp(1,1:n,1:n,1:n,1)
 !call sample(tmp, 1.0)
 !call dump("pHi", 1, (1-1)*dt, tmp)
 
-do l = 1,10000,3
+do l = 1,40000,3
         call step(l,   smp(:,:,:,:,1), smp(:,:,:,:,2), smp(:,:,:,:,3))
         call step(l+1, smp(:,:,:,:,2), smp(:,:,:,:,3), smp(:,:,:,:,1))
         call step(l+2, smp(:,:,:,:,3), smp(:,:,:,:,1), smp(:,:,:,:,2))
@@ -65,10 +81,6 @@ subroutine step(l, dn, hr, up)
         real, dimension(n) :: V, T, G, PE, KE, GE
         integer i, j, k, l; logical output
         
-        ! ... these will move ...
-        real, parameter :: a = 1.0, H = 0.0
-        real, parameter :: m2phi = 1.0, m2psi = 0.0, g2 = 1.0
-        
         ! Laplacian operator stencils: traditional one and three isotropic variants
         ! stable for dx/dt > sqrt(3), sqrt(2), sqrt(21)/3, and 8/sqrt(30) respectively
         ! computational cost difference is insignificant for large grids
@@ -79,10 +91,16 @@ subroutine step(l, dn, hr, up)
         real, parameter :: c3 = 1.0, c2 = 3.0, c1 = 14.0, c0 = -128.0, cc = 30.0
         
         ! all coefficients inside the loop are pre-calculated
-        real, parameter :: c = cc * alpha**2 * a**2
-        real, parameter :: b0 = 2.0 + c0/c, b1 = c1/c, b2 = c2/c, b3 = c3/c
-        real, parameter :: d1 = 1.0 - 1.5*H*dt, d2 = 1.0/(1.0 + 1.5*H*dt)
-        real, parameter :: e1 = 1.0/(8.0*dt**2), e2 = 1.0/(8.0*(a*dx)**2), e3 = e2/3.0
+        real c, b0, b1, b2, b3, d1, d2, e1, e2, e3
+        
+        !select flat or expanding background
+        !real, parameter :: a = 1.0, H = 0.0
+        real a, H, Q, p; a = LA(2); H = 1.0/LH(2)
+        
+        c = cc * alpha**2 * a**2
+        b0 = 2.0 + c0/c; b1 = c1/c; b2 = c2/c; b3 = c3/c
+        d1 = 1.0 - 1.5*H*dt; d2 = 1.0/(1.0 + 1.5*H*dt)
+        e1 = 1.0/(8.0*dt**2); e2 = 1.0/(8.0*(a*dx)**2); e3 = e2/3.0
         
         PE = 0.0; KE = 0.0; GE = 0.0
         output = mod(l-1, n/nt) == 0
@@ -125,8 +143,15 @@ subroutine step(l, dn, hr, up)
         up(:,:,0,:) = up(:,:,n,:); up(:,:,n+1,:) = up(:,:,1,:)
         up(:,:,:,0) = up(:,:,:,n); up(:,:,:,n+1) = up(:,:,:,1)
         
+        ! update expansion factors
+        Q = sum(4.0*e1*KE - PE)/(6.0*n**3)
+        p = LH(1) + (1.0 + Q * LH(2)**2) * dt
+        LH = (/ LH(2), LH(1) + (1.0 + Q * p**2) * (2.0*dt) /)
+        LA = (/ LA(2), LA(1) + (H*a) * (2.0*dt) /)
+        
         ! dump simulation data
         if (output) then
+                write (*,'(5g)') (l-1)*dt, a, H, sum(e1*KE + e2*GE + 0.5*PE)/n**3, sum(e1*KE - e3*GE - 0.5*PE)/n**3
                 tmp = hr(phi,1:n,1:n,1:n); call dump("phi", (l-1)/(n/nt), (l-1)*dt, tmp)
                 tmp = hr(psi,1:n,1:n,1:n); call dump("psi", (l-1)/(n/nt), (l-1)*dt, tmp)
                 tmp = dn(phi,1:n,1:n,1:n); call dump("rho", (l-1)/(n/nt), (l-1)*dt, tmp)
