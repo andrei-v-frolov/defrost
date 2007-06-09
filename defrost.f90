@@ -1,5 +1,5 @@
-! $Id: defrost.f90,v 1.6 2007/06/05 06:22:59 frolov Exp $
-! [compile with: ifc -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
+! $Id: defrost.f90,v 1.7 2007/06/09 01:38:58 frolov Exp $
+! [compile with: ifort -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
 
@@ -65,9 +65,9 @@ smp(phi,:,:,:,2) = phi0
 !call dump("pHi", 1, (1-1)*dt, tmp)
 
 do l = 1,40000,3
-        call step(l,   smp(:,:,:,:,1), smp(:,:,:,:,2), smp(:,:,:,:,3))
-        call step(l+1, smp(:,:,:,:,2), smp(:,:,:,:,3), smp(:,:,:,:,1))
-        call step(l+2, smp(:,:,:,:,3), smp(:,:,:,:,1), smp(:,:,:,:,2))
+        call step(l,   smp(:,:,:,:,1), smp(:,:,:,:,2), smp(:,:,:,:,3), smp(:,:,:,:,1))
+        call step(l+1, smp(:,:,:,:,2), smp(:,:,:,:,3), smp(:,:,:,:,1), smp(:,:,:,:,2))
+        call step(l+2, smp(:,:,:,:,3), smp(:,:,:,:,1), smp(:,:,:,:,2), smp(:,:,:,:,3))
 end do
 
 contains
@@ -76,9 +76,8 @@ contains
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 ! scalar field evolution step
-subroutine step(l, dn, hr, up)
-        real, dimension(fields,0:p,0:p,0:p) :: dn, hr, up
-        real, dimension(n) :: V, T, G, PE, KE, GE
+subroutine step(l, dn, hr, up, pp)
+        real, dimension(fields,0:p,0:p,0:p) :: dn, hr, up, pp
         integer i, j, k, l; logical output
         
         ! Laplacian operator stencils: traditional one and three isotropic variants
@@ -90,22 +89,29 @@ subroutine step(l, dn, hr, up)
         !real, parameter :: c3 = 1.0, c2 = 0.0, c1 = 8.0, c0 = -56.0, cc = 12.0
         real, parameter :: c3 = 1.0, c2 = 3.0, c1 = 14.0, c0 = -128.0, cc = 30.0
         
+        ! basis vectors for vectorizing potential derivative
+        real, dimension(fields), parameter :: V1 = (/1,0/), V2 = (/0,1/)
+        
+        ! field energy (distributed for parallelization)
+        real, dimension(n) :: V, T, G, PE, KE, GE
+        
         ! all coefficients inside the loop are pre-calculated
-        real c, b0, b1, b2, b3, d1, d2, e1, e2, e3
+        real c, d, b0, b1, b2, b3, d1, d2, e1, e2, e3
         
         !select flat or expanding background
         !real, parameter :: a = 1.0, H = 0.0
         real a, H, Q, p; a = LA(2); H = 1.0/LH(2)
         
-        c = cc * alpha**2 * a**2
-        b0 = 2.0 + c0/c; b1 = c1/c; b2 = c2/c; b3 = c3/c
-        d1 = 1.0 - 1.5*H*dt; d2 = 1.0/(1.0 + 1.5*H*dt)
+        d = 1.0 + 1.5*H*dt; c = cc * alpha**2 * a**2 * d
+        b0 = 2.0/d + c0/c; b1 = c1/c; b2 = c2/c; b3 = c3/c
+        d1 = -(1.0 - 1.5*H*dt)/d; d2 = -dt**2/d
         e1 = 1.0/(8.0*dt**2); e2 = 1.0/(8.0*(a*dx)**2); e3 = e2/3.0
         
         PE = 0.0; KE = 0.0; GE = 0.0
         output = mod(l-1, n/nt) == 0
         
         do k = 1,n; do j = 1,n; do i = 1,n
+                ! discretized scalar field evolution step
                 up(:,i,j,k) =                                                                                                &
                     b0 * hr(:,i,j,k) +                                                                                       &
                     b1 * ( hr(:,i-1,j,k) + hr(:,i+1,j,k) + hr(:,i,j-1,k) + hr(:,i,j+1,k) + hr(:,i,j,k-1) + hr(:,i,j,k+1) ) + &
@@ -113,12 +119,10 @@ subroutine step(l, dn, hr, up)
                          + hr(:,i-1,j,k-1) + hr(:,i+1,j,k-1) + hr(:,i-1,j,k+1) + hr(:,i+1,j,k+1)                             &
                          + hr(:,i,j-1,k-1) + hr(:,i,j+1,k-1) + hr(:,i,j-1,k+1) + hr(:,i,j+1,k+1) ) +                         &
                     b3 * ( hr(:,i-1,j-1,k-1) + hr(:,i+1,j-1,k-1) + hr(:,i-1,j+1,k-1) + hr(:,i+1,j+1,k-1)                     &
-                         + hr(:,i-1,j-1,k+1) + hr(:,i+1,j-1,k+1) + hr(:,i-1,j+1,k+1) + hr(:,i+1,j+1,k+1) ) -                 &
-                    d1 * dn(:,i,j,k)
-                
+                         + hr(:,i-1,j-1,k+1) + hr(:,i+1,j-1,k+1) + hr(:,i-1,j+1,k+1) + hr(:,i+1,j+1,k+1) ) +                 &
+                    d1 * dn(:,i,j,k) +                                                                                       &
                 ! scalar field potential derivatives are inlined here
-                up(phi,i,j,k) = d2 * (up(phi,i,j,k) - (m2phi + g2*hr(psi,i,j,k)**2) * hr(phi,i,j,k) * dt**2)
-                up(psi,i,j,k) = d2 * (up(psi,i,j,k) - (m2psi + g2*hr(phi,i,j,k)**2) * hr(psi,i,j,k) * dt**2)
+                    d2 * ( (m2phi + g2*hr(psi,i,j,k)**2)*V1 + (m2psi + g2*hr(phi,i,j,k)**2)*V2 ) * hr(:,i,j,k)
                 
                 ! scalar field potential multiplied by 2 is inlined here
                 V(k) = (m2phi + g2*hr(psi,i,j,k)**2)*hr(phi,i,j,k)**2 + m2psi*hr(psi,i,j,k)**2
@@ -131,8 +135,8 @@ subroutine step(l, dn, hr, up)
                         G(k) = sum( (hr(:,i+1,j,k)-hr(:,i-1,j,k))**2 &
                                   + (hr(:,i,j+1,k)-hr(:,i,j-1,k))**2 &
                                   + (hr(:,i,j,k+1)-hr(:,i,j,k-1))**2 )
-                        dn(phi,i,j,k) = e1*T(k) + e2*G(k) + 0.5*V(k)
-                        dn(psi,i,j,k) = e1*T(k) - e3*G(k) - 0.5*V(k)
+                        pp(phi,i,j,k) = e1*T(k) + e2*G(k) + 0.5*V(k)
+                        pp(psi,i,j,k) = e1*T(k) - e3*G(k) - 0.5*V(k)
                         
                         GE(k) = GE(k) + G(k)
                 end if
@@ -154,8 +158,8 @@ subroutine step(l, dn, hr, up)
                 write (*,'(5g)') (l-1)*dt, a, H, sum(e1*KE + e2*GE + 0.5*PE)/n**3, sum(e1*KE - e3*GE - 0.5*PE)/n**3
                 tmp = hr(phi,1:n,1:n,1:n); call dump("phi", (l-1)/(n/nt), (l-1)*dt, tmp)
                 tmp = hr(psi,1:n,1:n,1:n); call dump("psi", (l-1)/(n/nt), (l-1)*dt, tmp)
-                tmp = dn(phi,1:n,1:n,1:n); call dump("rho", (l-1)/(n/nt), (l-1)*dt, tmp)
-                tmp = dn(psi,1:n,1:n,1:n); call dump("p",   (l-1)/(n/nt), (l-1)*dt, tmp)
+                tmp = pp(phi,1:n,1:n,1:n); call dump("rho", (l-1)/(n/nt), (l-1)*dt, tmp)
+                tmp = pp(psi,1:n,1:n,1:n); call dump("p",   (l-1)/(n/nt), (l-1)*dt, tmp)
         end if
 end subroutine step
 
