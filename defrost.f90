@@ -1,9 +1,14 @@
-! $Id: defrost.f90,v 1.7 2007/06/09 01:38:58 frolov Exp $
+! $Id: defrost.f90,v 1.8 2007/06/12 09:00:51 frolov Exp $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
+! http://www.sfu.ca/physics/cosmology/defrost
 
-program main; implicit none
+! Copyright (C) 2007 Andrei Frolov <frolov@sfu.ca>
+! Distributed under the terms of the GNU General Public License
+! If you use this code for your research, please cite hep-../...
+
+program defrost; implicit none
 
 include "fftw3.f"
 
@@ -14,17 +19,31 @@ include "fftw3.f"
 real, parameter :: twopi = 6.2831853071795864769252867665590
 real, parameter :: sqrt3 = 1.7320508075688772935274463415059
 
-! control parameters
-integer, parameter :: n = 32                    ! grid size: spatial grid contains n^3 points
+! solver control parameters
+integer, parameter :: n = 32                    ! sampled grid size (simulation cube is n^3 pts)
 integer, parameter :: p = n+2                   ! padded grid size (adjust for cache efficiency)
-integer, parameter :: nn = n/2+1                ! Nyquist frequency
-integer, parameter :: ns = sqrt3*(n/2) + 2      ! ...
+integer, parameter :: tt = 40000                ! total number of time steps to take (i.e. runtime)
+integer, parameter :: nn = n/2+1                ! Nyquist frequency (calculated, leave it alone)
+integer, parameter :: ns = sqrt3*(n/2) + 2      ! highest wavenumber on 3D grid (leave it alone)
 
-integer, parameter :: nt = 32                   ! ...
-integer, parameter :: nx = 32                   ! ...
+real, parameter :: alpha = 2.0                  ! dx/dt (be careful not to violate Courant condition)
+real, parameter :: dx = 1.0/n                   ! grid spacing   (physical grid size is n*dx)
+real, parameter :: dt = dx/alpha                ! time step size (simulated timespan is tt*dt)
 
-real, parameter :: alpha = 2.0
-real, parameter :: dx = 1.0/n, dt = dx/alpha
+! output control parameters
+integer, parameter :: nt = 32                   ! simulation will be logged every n/nt time steps
+integer, parameter :: nx = 32                   ! spatial grid is downsampled to nx^3 pts for output
+
+logical, parameter :: output = .false.          ! set this to false to disable all file output at once
+
+logical, parameter :: output$bov = .true.       ! output 3D data cube (storage-expensive)
+logical, parameter :: output$psd = .true.       ! output power spectra (time-expensive)
+logical, parameter :: output$cdf = .true.       ! output distributions (time-expensive)
+
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+! potential and its derivatives are (separately) inlined in step()
 
 ! ... these will move ...
 real, parameter :: m2phi = 1.0, m2psi = 0.0, g2 = 1.0
@@ -41,6 +60,9 @@ real, parameter ::  ddH0 = -dphi0*ddphi0
 real :: LA(2) = (/ 1.0 - H0*dt, 1.0 /)
 real :: LH(2) = 1.0/(/ H0 - dH0*dt + ddH0*dt**2/2.0, H0 /)
 
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
 integer l
 integer i,j,k
 
@@ -54,6 +76,11 @@ integer, parameter :: phi = 1, psi = 2, fields = 2; real smp(fields,0:p,0:p,0:p,
 !call dfftw_init_threads
 !call dfftw_plan_with_nthreads(4)
 
+call id("$Revision: 1.8 $")
+
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
 smp = 0.0
 !smp(1,n/2,n/2,n/2,:) = 1.0
 !forall (i=1:n,j=1:n,k=1:n) smp(1,i,j,k,:) = exp(-((i-nn)**2 + (j-nn)**2 + (k-nn)**2)*(dx/0.1)**2)
@@ -64,7 +91,7 @@ smp(phi,:,:,:,2) = phi0
 !call sample(tmp, 1.0)
 !call dump("pHi", 1, (1-1)*dt, tmp)
 
-do l = 1,40000,3
+do l = 1,tt,3
         call step(l,   smp(:,:,:,:,1), smp(:,:,:,:,2), smp(:,:,:,:,3), smp(:,:,:,:,1))
         call step(l+1, smp(:,:,:,:,2), smp(:,:,:,:,3), smp(:,:,:,:,1), smp(:,:,:,:,2))
         call step(l+2, smp(:,:,:,:,3), smp(:,:,:,:,1), smp(:,:,:,:,2), smp(:,:,:,:,3))
@@ -78,7 +105,7 @@ contains
 ! scalar field evolution step
 subroutine step(l, dn, hr, up, pp)
         real, dimension(fields,0:p,0:p,0:p) :: dn, hr, up, pp
-        integer i, j, k, l; logical output
+        integer i, j, k, l; logical checkpt
         
         ! Laplacian operator stencils: traditional one and three isotropic variants
         ! stable for dx/dt > sqrt(3), sqrt(2), sqrt(21)/3, and 8/sqrt(30) respectively
@@ -108,7 +135,7 @@ subroutine step(l, dn, hr, up, pp)
         e1 = 1.0/(8.0*dt**2); e2 = 1.0/(8.0*(a*dx)**2); e3 = e2/3.0
         
         PE = 0.0; KE = 0.0; GE = 0.0
-        output = mod(l-1, n/nt) == 0
+        checkpt = mod(l-1, n/nt) == 0
         
         do k = 1,n; do j = 1,n; do i = 1,n
                 ! discretized scalar field evolution step
@@ -131,7 +158,7 @@ subroutine step(l, dn, hr, up, pp)
                 PE(k) = PE(k) + V(k); KE(k) = KE(k) + T(k)
                 
                 ! calculate density and pressure when needed
-                if (output) then
+                if (checkpt) then
                         G(k) = sum( (hr(:,i+1,j,k)-hr(:,i-1,j,k))**2 &
                                   + (hr(:,i,j+1,k)-hr(:,i,j-1,k))**2 &
                                   + (hr(:,i,j,k+1)-hr(:,i,j,k-1))**2 )
@@ -154,12 +181,15 @@ subroutine step(l, dn, hr, up, pp)
         LA = (/ LA(2), LA(1) + (H*a) * (2.0*dt) /)
         
         ! dump simulation data
-        if (output) then
+        if (checkpt) then
                 write (*,'(5g)') (l-1)*dt, a, H, sum(e1*KE + e2*GE + 0.5*PE)/n**3, sum(e1*KE - e3*GE - 0.5*PE)/n**3
-                tmp = hr(phi,1:n,1:n,1:n); call dump("phi", (l-1)/(n/nt), (l-1)*dt, tmp)
-                tmp = hr(psi,1:n,1:n,1:n); call dump("psi", (l-1)/(n/nt), (l-1)*dt, tmp)
-                tmp = pp(phi,1:n,1:n,1:n); call dump("rho", (l-1)/(n/nt), (l-1)*dt, tmp)
-                tmp = pp(psi,1:n,1:n,1:n); call dump("p",   (l-1)/(n/nt), (l-1)*dt, tmp)
+                
+                if (output .and. (output$bov .or. output$psd .or. output$cdf)) then
+                        tmp = hr(phi,1:n,1:n,1:n); call dump("phi", (l-1)/(n/nt), (l-1)*dt, tmp)
+                        tmp = hr(psi,1:n,1:n,1:n); call dump("psi", (l-1)/(n/nt), (l-1)*dt, tmp)
+                        tmp = pp(phi,1:n,1:n,1:n); call dump("rho", (l-1)/(n/nt), (l-1)*dt, tmp)
+                        tmp = pp(psi,1:n,1:n,1:n); call dump("pre", (l-1)/(n/nt), (l-1)*dt, tmp)
+                end if
         end if
 end subroutine step
 
@@ -281,7 +311,24 @@ end subroutine sieve
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-! 
+! identify yourself
+subroutine id(rev)
+        character(*) :: rev; integer a, b
+        
+        a = index(rev,": ") + 2
+        b = index(rev," $", .true.) - 1
+        
+        write (*,'(3g,2(i0,g))') "# This is DEFROST revision ", rev(a:b), " (", fields, " fields, ", n, "^3 grid)"
+        write (*,'(g,3(f0.5,g))') "# V(phi,psi) = ", &
+                sqrt(m2phi), "^2*phi^2/2 + ",        &
+                sqrt(m2psi), "^2*psi^2/2 + ",        &
+                sqrt(g2), "^2*phi^2*psi^2/2"
+        write (*,'(2g)') "# ", repeat('=', 119)
+        write (*,'(g,g12.12,5g25.12)') "# OUTPUT:", "t,", "a,", "H,", "<rho>,", "<P>;"
+        write (*,'(2g)') "# ", repeat('=', 119)
+end subroutine id
+
+! output field configuration and its aggregates
 subroutine dump(file, frame, t, f)
         character(*) :: file; integer frame, k; real t, f(n,n,n);
         character(256) :: buffer; real avg, var, S(ns), P(n+1), X(n+1);
@@ -289,53 +336,70 @@ subroutine dump(file, frame, t, f)
         integer, parameter :: stride = n/nx
         real, parameter :: dk = twopi/(n*dx)
         
-        return
+        ! output 3D box of values
+        if (output$bov) then
+                write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.bov'; open(10, file=buffer)
+                write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.raw'; open(11, file=buffer, form="binary")
+                
+                ! BOV header
+                write (10,'(4g)') "TIME:        ", t
+                write (10,'(4g)') "BRICK_ORIGIN:", 0.0, 0.0, 0.0
+                write (10,'(4g)') "BRICK_SIZE:  ", n*dx, n*dx, n*dx
+                write (10,'(4g)') "VARIABLE:        ", file
+                write (10,'(4g)') "DATA_FILE:       ", buffer
+                write (10,'(g,3i5)') "DATA_SIZE:     ", nx, nx, nx
+                write (10,'(4g)') "DATA_FORMAT:     ", "DOUBLE"
+                write (10,'(4g)') "DATA_ENDIAN:     ", "LITTLE"
+                write (10,'(4g)') "CENTERING:       ", "zonal"
+                
+                ! raw data
+                if (stride > 1) then; do k=1,n,stride; write (11) f(::stride,::stride,k); end do; else; write (11) f; end if
+                
+                close (10); close (11)
+        end if
         
-        write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.ult'; open(12, file=buffer)
-        write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.bov'; open(10, file=buffer)
-        write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.raw'; open(11, file=buffer, form="binary")
+        ! all curves go into a single file
+        if (output$psd .or. output$cdf) then
+                write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.ult'; open(12, file=buffer)
+        end if
         
-        ! BOV header
-        write (10,'(4g)') "TIME:        ", t
-        write (10,'(4g)') "BRICK_ORIGIN:", 0.0, 0.0, 0.0
-        write (10,'(4g)') "BRICK_SIZE:  ", n*dx, n*dx, n*dx
-        write (10,'(4g)') "VARIABLE:        ", file
-        write (10,'(4g)') "DATA_FILE:       ", buffer
-        write (10,'(g,3i5)') "DATA_SIZE:     ", nx, nx, nx
-        write (10,'(4g)') "DATA_FORMAT:     ", "DOUBLE"
-        write (10,'(4g)') "DATA_ENDIAN:     ", "LITTLE"
-        write (10,'(4g)') "CENTERING:       ", "zonal"
+        ! output power spectrum
+        if (output$psd) then
+                call spectrum(f, S)
+                
+                write (12,'(g)') "# PSD"
+                do k = 1,ns; write (12,'(2g)') (k-1)*dk, S(k); end do
+                write (12,'(g)') "", ""
+                
+                write (12,'(g)') "# PSD [logarithmic]"
+                do k = 2,ns; write (12,'(2g)') log10((k-1)*dk), log10(S(k)); end do
+                write (12,'(g)') "", ""
+        end if
         
-        ! raw data
-        if (stride > 1) then; do k=1,n,stride; write (11) f(::stride,::stride,k); end do; else; write (11) f; end if
+        ! output distribution of values
+        if (output$cdf) then
+                call sieve(f, n**3, n**2, 1)
+                P(1:n) = f(1,1,:); P(n+1) = maxval(f(:,:,n))
+                avg = sum(P)/(n+1); var = sum((P-avg)**2)/n; X = (P-avg)/sqrt(2.0*var)
+                
+                write (12,'(g)') "# CDF"
+                do k = 1,n+1; write (12,'(2g)') P(k), real(k-1)/n; end do
+                write (12,'(g)') "", ""
+                
+                write (12,'(g)') "# CDF [gaussian]"
+                do k = 1,n+1; write (12,'(2g)') P(k), (1.0 + erf(X(k)))/2.0; end do
+                write (12,'(g)') "", ""
+                
+                write (12,'(g)') "# PDF"
+                do k = 2,n; write (12,'(2g)') P(k), (2.0/n)/(P(k+1)-P(k-1)); end do
+                write (12,'(g)') "", ""
+                
+                write (12,'(g)') "# PDF [gaussian]"
+                do k = 2,n; write (12,'(2g)') P(k), exp(-X(k)**2)/sqrt(twopi*var); end do
+                write (12,'(g)') "", ""
+        end if
         
-        ! power spectrum
-        call spectrum(f, S)
-        
-        write (12,'(g)') "# PSD"
-        do k = 1,ns; write (12,'(2g)') (k-1)*dk, S(k); end do
-        
-        write (12,'(g)') "", "", "# PSD [logarithmic]"
-        do k = 2,ns; write (12,'(2g)') log10((k-1)*dk), log10(S(k)); end do
-        
-        ! value distribution
-        call sieve(f, n**3, n**2, 1)
-        P(1:n) = f(1,1,:); P(n+1) = maxval(f(:,:,n))
-        avg = sum(P)/(n+1); var = sum((P-avg)**2)/n; X = (P-avg)/sqrt(2.0*var)
-        
-        write (12,'(g)') "", "", "# CDF"
-        do k = 1,n+1; write (12,'(2g)') P(k), real(k-1)/n; end do
-        
-        write (12,'(g)') "", "", "# CDF [gaussian]"
-        do k = 1,n+1; write (12,'(2g)') P(k), (1.0 + erf(X(k)))/2.0; end do
-        
-        write (12,'(g)') "", "", "# PDF"
-        do k = 2,n; write (12,'(2g)') P(k), (2.0/n)/(P(k+1)-P(k-1)); end do
-        
-        write (12,'(g)') "", "", "# PDF [gaussian]"
-        do k = 2,n; write (12,'(2g)') P(k), exp(-X(k)**2)/sqrt(twopi*var); end do
-        
-        close (10); close (11); close (12)
+        if (output$psd .or. output$cdf) close (12)
 end subroutine dump
 
 end
