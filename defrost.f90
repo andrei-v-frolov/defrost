@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 1.8 2007/06/12 09:00:51 frolov Exp $
+! $Id: defrost.f90,v 1.9 2007/06/15 21:26:54 frolov Exp $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -21,7 +21,7 @@ real, parameter :: sqrt3 = 1.7320508075688772935274463415059
 
 ! solver control parameters
 integer, parameter :: n = 32                    ! sampled grid size (simulation cube is n^3 pts)
-integer, parameter :: p = n+2                   ! padded grid size (adjust for cache efficiency)
+integer, parameter :: p = n+2                   ! padded grid size (>n, adjust for cache efficiency)
 integer, parameter :: tt = 40000                ! total number of time steps to take (i.e. runtime)
 integer, parameter :: nn = n/2+1                ! Nyquist frequency (calculated, leave it alone)
 integer, parameter :: ns = sqrt3*(n/2) + 2      ! highest wavenumber on 3D grid (leave it alone)
@@ -31,8 +31,8 @@ real, parameter :: dx = 1.0/n                   ! grid spacing   (physical grid 
 real, parameter :: dt = dx/alpha                ! time step size (simulated timespan is tt*dt)
 
 ! output control parameters
-integer, parameter :: nt = 32                   ! simulation will be logged every n/nt time steps
 integer, parameter :: nx = 32                   ! spatial grid is downsampled to nx^3 pts for output
+integer, parameter :: nt = n/nx                 ! simulation will be logged every nt time steps
 
 logical, parameter :: output = .false.          ! set this to false to disable all file output at once
 
@@ -40,8 +40,17 @@ logical, parameter :: output$bov = .true.       ! output 3D data cube (storage-e
 logical, parameter :: output$psd = .true.       ! output power spectra (time-expensive)
 logical, parameter :: output$cdf = .true.       ! output distributions (time-expensive)
 
+logical, parameter :: output$fld = .false.      ! output scalar fields
+logical, parameter :: output$set = .false.      ! output stress-energy tensor components
+logical, parameter :: output$pot = .false.      ! output gravitatinal potential (expensive)
+
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+! fields are referred to by their symbolic aliases
+integer, parameter :: fields = 2                ! total number of scalar fields being evolved
+integer, parameter :: phi = 1, psi = 2          ! symbolic aliases for scalar fields
+integer, parameter :: rho = 1, prs = 2          ! symbolic aliases for stress-energy
 
 ! potential and its derivatives are (separately) inlined in step()
 
@@ -64,19 +73,19 @@ real :: LH(2) = 1.0/(/ H0 - dH0*dt + ddH0*dt**2/2.0, H0 /)
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 integer l
-integer i,j,k
 
 ! smp array samples all fields on a 3D grid for three subsequent time slices
-integer, parameter :: phi = 1, psi = 2, fields = 2; real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n)
+real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n); complex Fk(nn,n,n)
 
 ! for larger grids, dynamically allocated array might be required
-! real, allocatable :: smp(:,:,:,:,:), tmp(:,:,:); allocate(smp(fields,0:p,0:p,0:p,3), tmp(n,n,n))
+! real, allocatable :: smp(:,:,:,:,:), tmp(:,:,:); complex, allocatable :: Fk(:,:,:)
+! allocate(smp(fields,0:p,0:p,0:p,3), tmp(n,n,n), Fk(nn,n,n))
 
 ! use threaded FFTW on SMP machines (link with -lfftw3_threads)
 !call dfftw_init_threads
 !call dfftw_plan_with_nthreads(4)
 
-call id("$Revision: 1.8 $")
+call id("$Revision: 1.9 $")
 
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -104,8 +113,7 @@ contains
 
 ! scalar field evolution step
 subroutine step(l, dn, hr, up, pp)
-        real, dimension(fields,0:p,0:p,0:p) :: dn, hr, up, pp
-        integer i, j, k, l; logical checkpt
+        real, dimension(fields,0:p,0:p,0:p) :: dn, hr, up, pp; integer i, j, k, l
         
         ! Laplacian operator stencils: traditional one and three isotropic variants
         ! stable for dx/dt > sqrt(3), sqrt(2), sqrt(21)/3, and 8/sqrt(30) respectively
@@ -125,6 +133,11 @@ subroutine step(l, dn, hr, up, pp)
         ! all coefficients inside the loop are pre-calculated
         real c, d, b0, b1, b2, b3, d1, d2, e1, e2, e3
         
+        ! optional computations flags
+        logical, parameter :: dumping = output .and. (output$bov .or. output$psd .or. output$cdf)
+        logical, parameter :: needTii = dumping .and. (output$set .or. output$pot)
+        logical checkpt
+        
         !select flat or expanding background
         !real, parameter :: a = 1.0, H = 0.0
         real a, H, Q, p; a = LA(2); H = 1.0/LH(2)
@@ -135,7 +148,7 @@ subroutine step(l, dn, hr, up, pp)
         e1 = 1.0/(8.0*dt**2); e2 = 1.0/(8.0*(a*dx)**2); e3 = e2/3.0
         
         PE = 0.0; KE = 0.0; GE = 0.0
-        checkpt = mod(l-1, n/nt) == 0
+        checkpt = mod(l-1, nt) == 0
         
         do k = 1,n; do j = 1,n; do i = 1,n
                 ! discretized scalar field evolution step
@@ -162,10 +175,13 @@ subroutine step(l, dn, hr, up, pp)
                         G(k) = sum( (hr(:,i+1,j,k)-hr(:,i-1,j,k))**2 &
                                   + (hr(:,i,j+1,k)-hr(:,i,j-1,k))**2 &
                                   + (hr(:,i,j,k+1)-hr(:,i,j,k-1))**2 )
-                        pp(phi,i,j,k) = e1*T(k) + e2*G(k) + 0.5*V(k)
-                        pp(psi,i,j,k) = e1*T(k) - e3*G(k) - 0.5*V(k)
                         
                         GE(k) = GE(k) + G(k)
+                        
+                        if (needTii) then
+                                pp(rho,i,j,k) = e1*T(k) + e2*G(k) + 0.5*V(k)
+                                pp(prs,i,j,k) = e1*T(k) - e3*G(k) - 0.5*V(k)
+                        end if
                 end if
         end do; end do; end do
         
@@ -184,11 +200,17 @@ subroutine step(l, dn, hr, up, pp)
         if (checkpt) then
                 write (*,'(5g)') (l-1)*dt, a, H, sum(e1*KE + e2*GE + 0.5*PE)/n**3, sum(e1*KE - e3*GE - 0.5*PE)/n**3
                 
-                if (output .and. (output$bov .or. output$psd .or. output$cdf)) then
-                        tmp = hr(phi,1:n,1:n,1:n); call dump("phi", (l-1)/(n/nt), (l-1)*dt, tmp)
-                        tmp = hr(psi,1:n,1:n,1:n); call dump("psi", (l-1)/(n/nt), (l-1)*dt, tmp)
-                        tmp = pp(phi,1:n,1:n,1:n); call dump("rho", (l-1)/(n/nt), (l-1)*dt, tmp)
-                        tmp = pp(psi,1:n,1:n,1:n); call dump("pre", (l-1)/(n/nt), (l-1)*dt, tmp)
+                if (dumping .and. output$fld) then
+                        tmp = hr(phi,1:n,1:n,1:n); call dump("phi", (l-1)/nt, (l-1)*dt, tmp)
+                        tmp = hr(psi,1:n,1:n,1:n); call dump("psi", (l-1)/nt, (l-1)*dt, tmp)
+                end if
+                if (dumping .and. output$set) then
+                        tmp = pp(rho,1:n,1:n,1:n); call dump("rho", (l-1)/nt, (l-1)*dt, tmp)
+                        tmp = pp(prs,1:n,1:n,1:n); call dump("prs", (l-1)/nt, (l-1)*dt, tmp)
+                end if
+                if (dumping .and. output$pot) then
+                        tmp = 0.5*a**2*pp(rho,1:n,1:n,1:n); call laplace(tmp, tmp)
+                        call dump("PSI", (l-1)/nt, (l-1)*dt, tmp)
                 end if
         end if
 end subroutine step
@@ -198,7 +220,7 @@ end subroutine step
 
 ! sample Gaussian random field
 subroutine sample(f, sigma)
-        real f(n,n,n), sigma; complex Fk(nn,n,n); integer*8 plan
+        real f(n,n,n), sigma; integer*8 plan
         integer i, j, k; real :: s = 0.0, a(nn), p(nn)
         
         complex, parameter :: w = (0.0, twopi)
@@ -225,7 +247,7 @@ end subroutine sample
 
 ! solve Laplace equation $\Delta f = \rho$
 subroutine laplace(f, rho)
-        real f(n,n,n), rho(n,n,n); complex Fk(nn,n,n); integer*8 plan
+        real f(n,n,n), rho(n,n,n); integer*8 plan
         integer i, j, k; real :: ii, jj, kk
         
         real, parameter :: w = twopi/n
@@ -257,7 +279,7 @@ end subroutine laplace
 
 ! one-sided power spectrum density estimator
 subroutine spectrum(f, S)
-        real f(n,n,n), S(ns), W(ns); complex Fk(nn,n,n); integer*8 plan
+        real f(n,n,n), S(ns), W(ns); integer*8 plan
         integer i, j, k, ii, jj, kk, l; real p, c(2)
         
         call dfftw_plan_dft_r2c_3d(plan,n,n,n,f,Fk,FFTW_ESTIMATE)
