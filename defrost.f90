@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 1.9 2007/06/15 21:26:54 frolov Exp $
+! $Id: defrost.f90,v 1.10 2007/06/16 07:18:55 frolov Exp $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -34,7 +34,8 @@ real, parameter :: dt = dx/alpha                ! time step size (simulated time
 integer, parameter :: nx = 32                   ! spatial grid is downsampled to nx^3 pts for output
 integer, parameter :: nt = n/nx                 ! simulation will be logged every nt time steps
 
-logical, parameter :: output = .false.          ! set this to false to disable all file output at once
+logical, parameter :: output = .true.           ! set this to false to disable all file output at once
+logical, parameter :: oscale = .true.           ! scale output variables to counter-act expansion
 
 logical, parameter :: output$bov = .true.       ! output 3D data cube (storage-expensive)
 logical, parameter :: output$psd = .true.       ! output power spectra (time-expensive)
@@ -85,7 +86,7 @@ real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n); complex Fk(nn,n,n)
 !call dfftw_init_threads
 !call dfftw_plan_with_nthreads(4)
 
-call id("$Revision: 1.9 $")
+call id("$Revision: 1.10 $")
 
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -201,16 +202,18 @@ subroutine step(l, dn, hr, up, pp)
                 write (*,'(5g)') (l-1)*dt, a, H, sum(e1*KE + e2*GE + 0.5*PE)/n**3, sum(e1*KE - e3*GE - 0.5*PE)/n**3
                 
                 if (dumping .and. output$fld) then
-                        tmp = hr(phi,1:n,1:n,1:n); call dump("phi", (l-1)/nt, (l-1)*dt, tmp)
-                        tmp = hr(psi,1:n,1:n,1:n); call dump("psi", (l-1)/nt, (l-1)*dt, tmp)
+                        Q = 1.0; if (oscale) Q = a**1.5
+                        tmp = Q*hr(phi,1:n,1:n,1:n); call dump("phi", (l-1)/nt, (l-1)*dt, tmp)
+                        tmp = Q*hr(psi,1:n,1:n,1:n); call dump("psi", (l-1)/nt, (l-1)*dt, tmp)
                 end if
                 if (dumping .and. output$set) then
-                        tmp = pp(rho,1:n,1:n,1:n); call dump("rho", (l-1)/nt, (l-1)*dt, tmp)
-                        tmp = pp(prs,1:n,1:n,1:n); call dump("prs", (l-1)/nt, (l-1)*dt, tmp)
+                        Q = 1.0; if (oscale) Q = 1.0/(3.0*H**2)
+                        tmp = Q*pp(rho,1:n,1:n,1:n); call dump("rho", (l-1)/nt, (l-1)*dt, tmp)
+                        tmp = Q*pp(prs,1:n,1:n,1:n); call dump("prs", (l-1)/nt, (l-1)*dt, tmp)
                 end if
                 if (dumping .and. output$pot) then
-                        tmp = 0.5*a**2*pp(rho,1:n,1:n,1:n); call laplace(tmp, tmp)
-                        call dump("PSI", (l-1)/nt, (l-1)*dt, tmp)
+                        Q = a**2/2.0; tmp = Q*pp(rho,1:n,1:n,1:n)
+                        call laplace(tmp, tmp); call dump("PSI", (l-1)/nt, (l-1)*dt, tmp)
                 end if
         end if
 end subroutine step
