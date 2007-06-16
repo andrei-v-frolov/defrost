@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 1.10 2007/06/16 07:18:55 frolov Exp $
+! $Id: defrost.f90,v 1.11 2007/06/16 07:28:46 frolov Exp $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -86,20 +86,8 @@ real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n); complex Fk(nn,n,n)
 !call dfftw_init_threads
 !call dfftw_plan_with_nthreads(4)
 
-call id("$Revision: 1.10 $")
-
-
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-smp = 0.0
-!smp(1,n/2,n/2,n/2,:) = 1.0
-!forall (i=1:n,j=1:n,k=1:n) smp(1,i,j,k,:) = exp(-((i-nn)**2 + (j-nn)**2 + (k-nn)**2)*(dx/0.1)**2)
-smp(phi,:,:,:,1) = phi0 - dphi0*dt + ddphi0*dt**2/2.0
-smp(phi,:,:,:,2) = phi0
-
-!tmp = smp(1,1:n,1:n,1:n,1)
-!call sample(tmp, 1.0)
-!call dump("pHi", 1, (1-1)*dt, tmp)
+call id("$Revision: 1.11 $")
+call init(smp(:,:,:,:,1), smp(:,:,:,:,2))
 
 do l = 1,tt,3
         call step(l,   smp(:,:,:,:,1), smp(:,:,:,:,2), smp(:,:,:,:,3), smp(:,:,:,:,1))
@@ -111,6 +99,29 @@ contains
 
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+! periodic boundary conditions
+subroutine wrap(up)
+        real, dimension(fields,0:p,0:p,0:p) :: up
+        
+        up(:,0,:,:) = up(:,n,:,:); up(:,n+1,:,:) = up(:,1,:,:)
+        up(:,:,0,:) = up(:,:,n,:); up(:,:,n+1,:) = up(:,:,1,:)
+        up(:,:,:,0) = up(:,:,:,n); up(:,:,:,n+1) = up(:,:,:,1)
+end subroutine wrap
+
+! scalar field initial conditions
+subroutine init(dn, hr)
+        real, dimension(fields,0:p,0:p,0:p) :: dn, hr; integer i, j, k
+        
+        hr(phi,:,:,:) = phi0
+        dn(phi,:,:,:) = phi0 - dphi0*dt + ddphi0*dt**2/2.0
+        
+        !call sample(tmp, 1.0e-6)
+        hr(psi,1:n,1:n,1:n) = 0.0
+        dn(psi,1:n,1:n,1:n) = 0.0
+        
+        call wrap(dn); call wrap(hr)
+end subroutine init
 
 ! scalar field evolution step
 subroutine step(l, dn, hr, up, pp)
@@ -187,9 +198,7 @@ subroutine step(l, dn, hr, up, pp)
         end do; end do; end do
         
         ! periodic boundary conditions
-        up(:,0,:,:) = up(:,n,:,:); up(:,n+1,:,:) = up(:,1,:,:)
-        up(:,:,0,:) = up(:,:,n,:); up(:,:,n+1,:) = up(:,:,1,:)
-        up(:,:,:,0) = up(:,:,:,n); up(:,:,:,n+1) = up(:,:,:,1)
+        call wrap(up)
         
         ! update expansion factors
         Q = sum(4.0*e1*KE - PE)/(6.0*n**3)
