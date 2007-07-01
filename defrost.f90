@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 1.11 2007/06/16 07:28:46 frolov Exp $
+! $Id: defrost.f90,v 1.12 2007/07/01 23:38:16 frolov Exp $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -29,6 +29,7 @@ integer, parameter :: ns = sqrt3*(n/2) + 2      ! highest wavenumber on 3D grid 
 real, parameter :: alpha = 2.0                  ! dx/dt (be careful not to violate Courant condition)
 real, parameter :: dx = 1.0/n                   ! grid spacing   (physical grid size is n*dx)
 real, parameter :: dt = dx/alpha                ! time step size (simulated timespan is tt*dt)
+real, parameter :: dk = twopi/(n*dx)            ! frequency domain grid spacing (leave it alone)
 
 ! output control parameters
 integer, parameter :: nx = 32                   ! spatial grid is downsampled to nx^3 pts for output
@@ -56,7 +57,7 @@ integer, parameter :: rho = 1, prs = 2          ! symbolic aliases for stress-en
 ! potential and its derivatives are (separately) inlined in step()
 
 ! ... these will move ...
-real, parameter :: m2phi = 1.0, m2psi = 0.0, g2 = 1.0
+real, parameter :: m2phi = 1.0, m2psi = 0.0, g2 = 1.0, Mpl = 1.0e6
 
 ! initial conditions for homogeneous field component
 real, parameter ::  phi0 =  1.0093430384226378929425913902459
@@ -86,7 +87,11 @@ real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n); complex Fk(nn,n,n)
 !call dfftw_init_threads
 !call dfftw_plan_with_nthreads(4)
 
-call id("$Revision: 1.11 $")
+! initialize random number generator
+call random_seed
+
+! initialize and run simulation
+call id("$Revision: 1.12 $")
 call init(smp(:,:,:,:,1), smp(:,:,:,:,2))
 
 do l = 1,tt,3
@@ -111,14 +116,16 @@ end subroutine wrap
 
 ! scalar field initial conditions
 subroutine init(dn, hr)
-        real, dimension(fields,0:p,0:p,0:p) :: dn, hr; integer i, j, k
+        real, dimension(fields,0:p,0:p,0:p) :: dn, hr
         
-        hr(phi,:,:,:) = phi0
-        dn(phi,:,:,:) = phi0 - dphi0*dt + ddphi0*dt**2/2.0
+        real, parameter :: m2phi$eff = m2phi - 2.25*H0**2
+        real, parameter :: m2psi$eff = m2psi + g2*phi0**2 - 2.25*H0**2
         
-        !call sample(tmp, 1.0e-6)
-        hr(psi,1:n,1:n,1:n) = 0.0
-        dn(psi,1:n,1:n,1:n) = 0.0
+        call sample(tmp, -0.25, m2phi$eff); hr(phi,1:n,1:n,1:n) = tmp + phi0
+        call sample(tmp, -0.25, m2psi$eff); hr(psi,1:n,1:n,1:n) = tmp
+        
+        call sample(tmp, +0.25, m2phi$eff); dn(phi,1:n,1:n,1:n) = hr(phi,1:n,1:n,1:n) - tmp*dt - dphi0*dt + ddphi0*dt**2/2.0
+        call sample(tmp, +0.25, m2psi$eff); dn(psi,1:n,1:n,1:n) = hr(psi,1:n,1:n,1:n) - tmp*dt
         
         call wrap(dn); call wrap(hr)
 end subroutine init
@@ -142,7 +149,7 @@ subroutine step(l, dn, hr, up, pp)
         ! field energy (distributed for parallelization)
         real, dimension(n) :: V, T, G, PE, KE, GE
         
-        ! all coefficients inside the loop are pre-calculated
+        ! various evolution operator coefficients
         real c, d, b0, b1, b2, b3, d1, d2, e1, e2, e3
         
         ! optional computations flags
@@ -150,10 +157,11 @@ subroutine step(l, dn, hr, up, pp)
         logical, parameter :: needTii = dumping .and. (output$set .or. output$pot)
         logical checkpt
         
-        !select flat or expanding background
+        ! flat or expanding background
         !real, parameter :: a = 1.0, H = 0.0
         real a, H, Q, p; a = LA(2); H = 1.0/LH(2)
         
+        ! all coefficients inside the loop are pre-calculated here
         d = 1.0 + 1.5*H*dt; c = cc * alpha**2 * a**2 * d
         b0 = 2.0/d + c0/c; b1 = c1/c; b2 = c2/c; b3 = c3/c
         d1 = -(1.0 - 1.5*H*dt)/d; d2 = -dt**2/d
@@ -230,27 +238,46 @@ end subroutine step
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-! sample Gaussian random field
-subroutine sample(f, sigma)
-        real f(n,n,n), sigma; integer*8 plan
-        integer i, j, k; real :: s = 0.0, a(nn), p(nn)
+! sample Gaussian random field with power-law spectrum
+subroutine sample(f, gamma, m2eff)
+        real f(n,n,n), gamma, m2eff; integer*8 plan
         
+        integer, parameter :: os = 16, nos = n * os**2
+        real, parameter :: dxos = dx/os, dkos = dk/(2*os), kcut = nn*dk/2.0
+        real, parameter :: norm = 0.5/(n**3 * (twopi*dk**3)**0.5 * Mpl) * (dkos/dxos)
         complex, parameter :: w = (0.0, twopi)
         
+        real ker(nos), a(nn), p(nn)
+        integer i, j, k, l; real kk
+        
+        ! calculate (oversampled) radial profile of convolution kernel
+        do k = 1,nos; kk = (k-0.5)*dkos
+                ker(k) = kk*(kk**2 + m2eff)**gamma * exp(-(kk/kcut)**2)
+        end do
+        
+        call dfftw_plan_r2r_1d(plan,nos,ker,ker,FFTW_RODFT10,FFTW_ESTIMATE)
+        call dfftw_execute(plan); call dfftw_destroy_plan(plan)
+        
+        do k = 1,nos; ker(k) = norm * ker(k)/k; end do
+        
+        ! initialize 3D convolution kernel (using linear interpolation of radial profile)
         do k = 1,n; do j = 1,n; do i = 1,n
-                f(i,j,k) = (16.0 + (i-nn)**2 + (j-nn)**2 + (k-nn)**2)**(-3.0/4.0)
-                s = s + f(i,j,k)**2
+                kk = sqrt(real(i-nn)**2 + real(j-nn)**2 + real(k-nn)**2) * os; l = floor(kk)
+                
+                if (l > 0) then
+                        f(i,j,k) = ker(l) + (kk-l)*(ker(l+1)-ker(l))
+                else
+                        f(i,j,k) = (4.0*ker(1)-ker(2))/3.0
+                end if
         end do; end do; end do
         
-        s = sigma/sqrt(s*real(n)**3)
-        
+        ! convolve kernel with delta-correlated Gaussian noise
         call dfftw_plan_dft_r2c_3d(plan,n,n,n,f,Fk,FFTW_ESTIMATE)
         call dfftw_execute(plan); call dfftw_destroy_plan(plan)
         
-        call random_seed
         do k = 1,n; do j = 1,n
                 call random_number(a); call random_number(p)
-                Fk(:,j,k) = s * sqrt(-2.0*log(a)) * exp(w*p) * Fk(:,j,k)
+                Fk(:,j,k) = sqrt(-2.0*log(a)) * exp(w*p) * Fk(:,j,k)
         end do; end do
         
         call dfftw_plan_dft_c2r_3d(plan,n,n,n,Fk,f,FFTW_ESTIMATE)
@@ -368,7 +395,6 @@ subroutine dump(file, frame, t, f)
         character(256) :: buffer; real avg, var, S(ns), P(n+1), X(n+1);
         
         integer, parameter :: stride = n/nx
-        real, parameter :: dk = twopi/(n*dx)
         
         ! output 3D box of values
         if (output$bov) then
