@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 1.12 2007/07/01 23:38:16 frolov Exp $
+! $Id: defrost.f90,v 1.13 2007/07/02 00:00:51 frolov Exp $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -20,20 +20,20 @@ real, parameter :: twopi = 6.2831853071795864769252867665590
 real, parameter :: sqrt3 = 1.7320508075688772935274463415059
 
 ! solver control parameters
-integer, parameter :: n = 32                    ! sampled grid size (simulation cube is n^3 pts)
+integer, parameter :: n = 256                   ! sampled grid size (simulation cube is n^3 pts)
 integer, parameter :: p = n+2                   ! padded grid size (>n, adjust for cache efficiency)
-integer, parameter :: tt = 40000                ! total number of time steps to take (i.e. runtime)
+integer, parameter :: tt = 2**18                ! total number of time steps to take (i.e. runtime)
 integer, parameter :: nn = n/2+1                ! Nyquist frequency (calculated, leave it alone)
 integer, parameter :: ns = sqrt3*(n/2) + 2      ! highest wavenumber on 3D grid (leave it alone)
 
-real, parameter :: alpha = 2.0                  ! dx/dt (be careful not to violate Courant condition)
-real, parameter :: dx = 1.0/n                   ! grid spacing   (physical grid size is n*dx)
+real, parameter :: alpha = 40.0                 ! dx/dt (be careful not to violate Courant condition)
+real, parameter :: dx = 10.0/n                  ! grid spacing   (physical grid size is n*dx)
 real, parameter :: dt = dx/alpha                ! time step size (simulated timespan is tt*dt)
 real, parameter :: dk = twopi/(n*dx)            ! frequency domain grid spacing (leave it alone)
 
 ! output control parameters
-integer, parameter :: nx = 32                   ! spatial grid is downsampled to nx^3 pts for output
-integer, parameter :: nt = n/nx                 ! simulation will be logged every nt time steps
+integer, parameter :: nx = 128                  ! spatial grid is downsampled to nx^3 pts for output
+integer, parameter :: nt = 2**9                 ! simulation will be logged every nt time steps
 
 logical, parameter :: output = .true.           ! set this to false to disable all file output at once
 logical, parameter :: oscale = .true.           ! scale output variables to counter-act expansion
@@ -42,9 +42,9 @@ logical, parameter :: output$bov = .true.       ! output 3D data cube (storage-e
 logical, parameter :: output$psd = .true.       ! output power spectra (time-expensive)
 logical, parameter :: output$cdf = .true.       ! output distributions (time-expensive)
 
-logical, parameter :: output$fld = .false.      ! output scalar fields
-logical, parameter :: output$set = .false.      ! output stress-energy tensor components
-logical, parameter :: output$pot = .false.      ! output gravitatinal potential (expensive)
+logical, parameter :: output$fld = .true.       ! output scalar fields
+logical, parameter :: output$set = .true.       ! output stress-energy tensor components
+logical, parameter :: output$pot = .true.       ! output gravitatinal potential (expensive)
 
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -57,7 +57,7 @@ integer, parameter :: rho = 1, prs = 2          ! symbolic aliases for stress-en
 ! potential and its derivatives are (separately) inlined in step()
 
 ! ... these will move ...
-real, parameter :: m2phi = 1.0, m2psi = 0.0, g2 = 1.0, Mpl = 1.0e6
+real, parameter :: m2phi = 1.0, m2psi = 0.0, g2 = 100.0**2, mpl = 2.0e5
 
 ! initial conditions for homogeneous field component
 real, parameter ::  phi0 =  1.0093430384226378929425913902459
@@ -91,7 +91,7 @@ real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n); complex Fk(nn,n,n)
 call random_seed
 
 ! initialize and run simulation
-call id("$Revision: 1.12 $")
+call id("$Revision: 1.13 $")
 call init(smp(:,:,:,:,1), smp(:,:,:,:,2))
 
 do l = 1,tt,3
@@ -244,7 +244,7 @@ subroutine sample(f, gamma, m2eff)
         
         integer, parameter :: os = 16, nos = n * os**2
         real, parameter :: dxos = dx/os, dkos = dk/(2*os), kcut = nn*dk/2.0
-        real, parameter :: norm = 0.5/(n**3 * (twopi*dk**3)**0.5 * Mpl) * (dkos/dxos)
+        real, parameter :: norm = 0.5/(n**3 * (twopi*dk**3)**0.5 * mpl) * (dkos/dxos)
         complex, parameter :: w = (0.0, twopi)
         
         real ker(nos), a(nn), p(nn)
