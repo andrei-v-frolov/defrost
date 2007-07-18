@@ -1,5 +1,5 @@
-! $Id: defrost.f90,v 1.13 2007/07/02 00:00:51 frolov Exp $
-! [compile with: ifort -O3 -ipo -xT -r8 -pc80 defrost.f90 -lfftw3]
+! $Id: defrost.f90,v 1.14 2007/07/18 07:03:11 frolov Exp $
+! [compile with: ifort -O3 -ipo -xT -r8 -pc80 -fpp defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
 ! http://www.sfu.ca/physics/cosmology/defrost
@@ -91,7 +91,7 @@ real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n); complex Fk(nn,n,n)
 call random_seed
 
 ! initialize and run simulation
-call id("$Revision: 1.13 $")
+call id("$Revision: 1.14 $")
 call init(smp(:,:,:,:,1), smp(:,:,:,:,2))
 
 do l = 1,tt,3
@@ -130,6 +130,16 @@ subroutine init(dn, hr)
         call wrap(dn); call wrap(hr)
 end subroutine init
 
+! stencil operators (implemented as preprocessor macros)
+#define HR(x,y,z) hr(:,i+(x),j+(y),k+(z))
+#define GRAD2(x,y,z) sum((hr(:,i+(x),j+(y),k+(z))-hr(:,i,j,k))**2)
+
+#define RANK0(O) (O(0,0,0))
+#define RANK1(O) (O(-1,0,0) + O(1,0,0) + O(0,-1,0) + O(0,1,0) + O(0,0,-1) + O(0,0,1))
+#define RANK2(O) (O(-1,-1,0) + O(1,-1,0) + O(-1,1,0) + O(1,1,0) + O(-1,0,-1) + O(1,0,-1) + O(-1,0,1) + O(1,0,1) + O(0,-1,-1) + O(0,1,-1) + O(0,-1,1) + O(0,1,1))
+#define RANK3(O) (O(-1,-1,-1) + O(1,-1,-1) + O(-1,1,-1) + O(1,1,-1) + O(-1,-1,1) + O(1,-1,1) + O(-1,1,1) + O(1,1,1))
+#define STENCIL(C,O) ((C ## 0) * RANK0(O) + (C ## 1) * RANK1(O) + (C ## 2) * RANK2(O) + (C ## 3) * RANK3(O))
+
 ! scalar field evolution step
 subroutine step(l, dn, hr, up, pp)
         real, dimension(fields,0:p,0:p,0:p) :: dn, hr, up, pp; integer i, j, k, l
@@ -158,30 +168,22 @@ subroutine step(l, dn, hr, up, pp)
         logical checkpt
         
         ! flat or expanding background
-        !real, parameter :: a = 1.0, H = 0.0
+        !real, parameter :: a = 1.0, H = 0.0; real Q
         real a, H, Q, p; a = LA(2); H = 1.0/LH(2)
         
         ! all coefficients inside the loop are pre-calculated here
         d = 1.0 + 1.5*H*dt; c = cc * alpha**2 * a**2 * d
         b0 = 2.0/d + c0/c; b1 = c1/c; b2 = c2/c; b3 = c3/c
         d1 = -(1.0 - 1.5*H*dt)/d; d2 = -dt**2/d
-        e1 = 1.0/(8.0*dt**2); e2 = 1.0/(8.0*(a*dx)**2); e3 = e2/3.0
+        e1 = 1.0/(8.0*dt**2); e2 = 1.0/(4.0*(a*dx)**2*cc); e3 = e2/3.0
         
         PE = 0.0; KE = 0.0; GE = 0.0
         checkpt = mod(l-1, nt) == 0
         
         do k = 1,n; do j = 1,n; do i = 1,n
                 ! discretized scalar field evolution step
-                up(:,i,j,k) =                                                                                                &
-                    b0 * hr(:,i,j,k) +                                                                                       &
-                    b1 * ( hr(:,i-1,j,k) + hr(:,i+1,j,k) + hr(:,i,j-1,k) + hr(:,i,j+1,k) + hr(:,i,j,k-1) + hr(:,i,j,k+1) ) + &
-                    b2 * ( hr(:,i-1,j-1,k) + hr(:,i+1,j-1,k) + hr(:,i-1,j+1,k) + hr(:,i+1,j+1,k)                             &
-                         + hr(:,i-1,j,k-1) + hr(:,i+1,j,k-1) + hr(:,i-1,j,k+1) + hr(:,i+1,j,k+1)                             &
-                         + hr(:,i,j-1,k-1) + hr(:,i,j+1,k-1) + hr(:,i,j-1,k+1) + hr(:,i,j+1,k+1) ) +                         &
-                    b3 * ( hr(:,i-1,j-1,k-1) + hr(:,i+1,j-1,k-1) + hr(:,i-1,j+1,k-1) + hr(:,i+1,j+1,k-1)                     &
-                         + hr(:,i-1,j-1,k+1) + hr(:,i+1,j-1,k+1) + hr(:,i-1,j+1,k+1) + hr(:,i+1,j+1,k+1) ) +                 &
-                    d1 * dn(:,i,j,k) +                                                                                       &
                 ! scalar field potential derivatives are inlined here
+                up(:,i,j,k) = STENCIL(b,HR) + d1 * dn(:,i,j,k) + &
                     d2 * ( (m2phi + g2*hr(psi,i,j,k)**2)*V1 + (m2psi + g2*hr(phi,i,j,k)**2)*V2 ) * hr(:,i,j,k)
                 
                 ! scalar field potential multiplied by 2 is inlined here
@@ -192,11 +194,7 @@ subroutine step(l, dn, hr, up, pp)
                 
                 ! calculate density and pressure when needed
                 if (checkpt) then
-                        G(k) = sum( (hr(:,i+1,j,k)-hr(:,i-1,j,k))**2 &
-                                  + (hr(:,i,j+1,k)-hr(:,i,j-1,k))**2 &
-                                  + (hr(:,i,j,k+1)-hr(:,i,j,k-1))**2 )
-                        
-                        GE(k) = GE(k) + G(k)
+                        G(k) = STENCIL(c,GRAD2); GE(k) = GE(k) + G(k)
                         
                         if (needTii) then
                                 pp(rho,i,j,k) = e1*T(k) + e2*G(k) + 0.5*V(k)
