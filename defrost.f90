@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 1.15 2007/07/30 21:41:16 frolov Exp $
+! $Id: defrost.f90,v 1.16 2007/09/13 02:08:20 frolov Exp $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 -fpp defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -12,6 +12,10 @@ program defrost; implicit none
 
 include "fftw3.f"
 
+#ifdef SILO
+include "silo.inc"
+#endif
+
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
@@ -20,14 +24,14 @@ real, parameter :: twopi = 6.2831853071795864769252867665590
 real, parameter :: sqrt3 = 1.7320508075688772935274463415059
 
 ! solver control parameters
-integer, parameter :: n = 32                   ! sampled grid size (simulation cube is n^3 pts)
+integer, parameter :: n = 256                   ! sampled grid size (simulation cube is n^3 pts)
 integer, parameter :: p = n+2                   ! padded grid size (>n, adjust for cache efficiency)
 integer, parameter :: tt = 2**18                ! total number of time steps to take (i.e. runtime)
 integer, parameter :: nn = n/2+1                ! Nyquist frequency (calculated, leave it alone)
 integer, parameter :: ns = sqrt3*(n/2) + 2      ! highest wavenumber on 3D grid (leave it alone)
 
 real, parameter :: alpha = 40.0                 ! dx/dt (be careful not to violate Courant condition)
-real, parameter :: dx = 1.0/n                  ! grid spacing   (physical grid size is n*dx)
+real, parameter :: dx = 10.0/n                  ! grid spacing   (physical grid size is n*dx)
 real, parameter :: dt = dx/alpha                ! time step size (simulated timespan is tt*dt)
 real, parameter :: dk = twopi/(n*dx)            ! frequency domain grid spacing (leave it alone)
 
@@ -45,6 +49,7 @@ logical, parameter :: output$cdf = .true.       ! output distributions (time-exp
 logical, parameter :: output$fld = .true.       ! output scalar fields
 logical, parameter :: output$set = .true.       ! output stress-energy tensor components
 logical, parameter :: output$pot = .true.       ! output gravitatinal potential (expensive)
+logical, parameter :: output$any = output$fld .or. output$set .or. output$pot
 
 logical, parameter :: output$gnu = .true.       ! output curves in gnuplot format (sinle file)
 logical, parameter :: output$vis = .false.      ! output curves in VisIt X-Y format (per frame)
@@ -92,8 +97,10 @@ real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n); complex Fk(nn,n,n)
 ! allocate(smp(fields,0:p,0:p,0:p,3), tmp(n,n,n), Fk(nn,n,n))
 
 ! use threaded FFTW on SMP machines (link with -lfftw3_threads)
-!call dfftw_init_threads
-!call dfftw_plan_with_nthreads(4)
+#ifdef FFTWTHREADS
+call dfftw_init_threads
+call dfftw_plan_with_nthreads(FFTWTHREADS)
+#endif
 
 ! initialize random number generator
 call random_seed
@@ -173,7 +180,7 @@ subroutine step(l, dn, hr, up, pp)
         ! optional computations flags
         logical, parameter :: dumping = output .and. (output$bov .or. output$crv)
         logical, parameter :: needTii = dumping .and. (output$set .or. output$pot)
-        logical checkpt; integer idx
+        logical checkpt; integer db, idx
         
         ! flat or expanding background
         !real, parameter :: a = 1.0, H = 0.0; real Q
@@ -186,7 +193,8 @@ subroutine step(l, dn, hr, up, pp)
         e1 = 1.0/(8.0*dt**2); e2 = 1.0/(4.0*(a*dx)**2*cc); e3 = e2/3.0
         
         PE = 0.0; KE = 0.0; GE = 0.0
-        checkpt = mod(l-1, nt) == 0; idx = 0
+        checkpt = mod(l-1, nt) == 0
+        db = 0; idx = 0
         
         do k = 1,n; do j = 1,n; do i = 1,n
                 ! discretized scalar field evolution step
@@ -224,21 +232,23 @@ subroutine step(l, dn, hr, up, pp)
         if (checkpt) then
                 write (*,'(5g)') (l-1)*dt, a, H, sum(e1*KE + e2*GE + 0.5*PE)/n**3, sum(e1*KE - e3*GE - 0.5*PE)/n**3
                 
+                if (dumping .and. output$any) db = fopen("frame", (l-1)/nt, (l-1)*dt)
                 if (dumping .and. output$fld) then
                         Q = 1.0; if (oscale) Q = a**1.5
-                        tmp = Q*hr(phi,1:n,1:n,1:n); call dump("phi", (l-1)/nt, (l-1)*dt, tmp, idx)
-                        tmp = Q*hr(psi,1:n,1:n,1:n); call dump("psi", (l-1)/nt, (l-1)*dt, tmp, idx)
+                        tmp = Q*hr(phi,1:n,1:n,1:n); call dump(db, "phi", (l-1)/nt, (l-1)*dt, tmp, idx)
+                        tmp = Q*hr(psi,1:n,1:n,1:n); call dump(db, "psi", (l-1)/nt, (l-1)*dt, tmp, idx)
                 end if
                 if (dumping .and. output$set) then
                         Q = 1.0; if (oscale) Q = 1.0/(3.0*H**2)
-                        tmp = Q*pp(rho,1:n,1:n,1:n); call dump("rho", (l-1)/nt, (l-1)*dt, tmp, idx)
-                        tmp = Q*pp(prs,1:n,1:n,1:n); call dump("prs", (l-1)/nt, (l-1)*dt, tmp, idx)
+                        tmp = Q*pp(rho,1:n,1:n,1:n); call dump(db, "rho", (l-1)/nt, (l-1)*dt, tmp, idx)
+                        tmp = Q*pp(prs,1:n,1:n,1:n); call dump(db, "prs", (l-1)/nt, (l-1)*dt, tmp, idx)
                 end if
                 if (dumping .and. output$pot) then
                         Q = a**2/2.0; tmp = Q*pp(rho,1:n,1:n,1:n)
-                        call laplace(tmp, tmp); call dump("PSI", (l-1)/nt, (l-1)*dt, tmp, idx)
+                        call laplace(tmp, tmp); call dump(db, "PSI", (l-1)/nt, (l-1)*dt, tmp, idx)
                 end if
                 if (idx > 0 .and. output$gnu) call fflush((l-1)*dt, idx)
+                if (db /= 0) call fclose(db)
         end if
 end subroutine step
 
@@ -383,7 +393,7 @@ end subroutine sieve
 subroutine head(fd, vars)
         integer(4) fd; character(*) :: vars(:)
         character(512) :: buffer; integer a, b, l
-        character(*), parameter :: rev = "$Revision: 1.15 $"
+        character(*), parameter :: rev = "$Revision: 1.16 $"
         
         a = index(rev, ": ") + 2
         b = index(rev, " $", .true.) - 1
@@ -402,23 +412,69 @@ subroutine head(fd, vars)
         write (fd,'(2g)') "# ", repeat('=', l)
 end subroutine head
 
+! open frame
+function fopen(file, frame, t)
+        character(*) :: file; integer fopen, frame; real t
+
+#ifdef SILO
+        integer db, opts, e
+        integer, parameter :: D = 3, zones(D) = n, nodes(D) = n+1
+        real, parameter :: x(n+1) = (/0:n/)*dx
+        
+        character(256) :: buffer; write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.silo'
+        
+        if (.not. (output$bov .or. output$vis)) return
+        
+#define STR(string) string, len(string)
+        e = dbcreate(buffer, len_trim(buffer), DB_CLOBBER, DB_LOCAL, STR("DEFROST frame"), DB_HDF5, db)
+        
+        e = dbmkoptlist(3, opts)
+        e = dbaddiopt(opts, DBOPT_CYCLE, frame)
+        e = dbadddopt(opts, DBOPT_DTIME, t)
+        e = dbaddiopt(opts, DBOPT_COORDSYS, DB_CARTESIAN)
+        
+        e = dbputqm(db, STR("mesh"), STR("x"), STR("y"), STR("z"), x, x, x, nodes, D, DB_DOUBLE, DB_COLLINEAR, opts, e)
+        e = dbfreeoptlist(opts)
+        
+        fopen = db
+#else
+        fopen = 0
+#endif
+end function fopen
+
+! close frame
+subroutine fclose(db)
+        integer db, e
+        
+#ifdef SILO
+        e = dbclose(db)
+#endif
+end subroutine fclose
+
 ! output field configuration and its aggregates
-subroutine dump(file, frame, t, f, idx)
-        character(*) :: file; integer frame, k; real t, f(n,n,n); integer, optional :: idx
-        character(256) :: buffer; real avg, var, S(ns), P(n+1), X(n+1);
+subroutine dump(db, v, frame, t, f, idx)
+        character(*) :: v; integer db, frame, k; real t, f(n,n,n); integer, optional :: idx
+        character(256) :: buffer; real avg, var, S(ns), P(n+1), X(n+1), PDF(2:n);
+        
+#ifdef SILO
+        integer e; integer, parameter :: D = 3, zones(D) = n, nodes(D) = n+1
+#endif
         
         integer, parameter :: stride = n/nx
         
         ! output 3D box of values
         if (output$bov) then
-                write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.bov'; open(10, file=buffer)
-                write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.raw'; open(11, file=buffer, form="binary")
+#ifdef SILO
+                e = dbputqv1(db, STR(v), STR("mesh"), f, zones, D, DB_F77NULL, 0, DB_DOUBLE, DB_ZONECENT, DB_F77NULL, e)
+#else
+                write (buffer,'(a,a,i6.6,a)') v, '-', frame, '.bov'; open(10, file=buffer)
+                write (buffer,'(a,a,i6.6,a)') v, '-', frame, '.raw'; open(11, file=buffer, form="binary")
                 
                 ! BOV header
                 write (10,'(4g)') "TIME:        ", t
                 write (10,'(4g)') "BRICK_ORIGIN:", 0.0, 0.0, 0.0
                 write (10,'(4g)') "BRICK_SIZE:  ", n*dx, n*dx, n*dx
-                write (10,'(4g)') "VARIABLE:        ", file
+                write (10,'(4g)') "VARIABLE:        ", v
                 write (10,'(4g)') "DATA_FILE:       ", buffer
                 write (10,'(g,3i5)') "DATA_SIZE:     ", nx, nx, nx
                 write (10,'(4g)') "DATA_FORMAT:     ", "DOUBLE"
@@ -429,24 +485,31 @@ subroutine dump(file, frame, t, f, idx)
                 if (stride > 1) then; do k=1,n,stride; write (11) f(::stride,::stride,k); end do; else; write (11) f; end if
                 
                 close (10); close (11)
+#endif
         end if
         
         ! output spectra and statistics
         if (output$crv) then
+#ifndef SILO
                 ! in VisIt format, all curves go into a single file per field, per frame
                 if (output$vis) then
-                        write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.ult'; open(12, file=buffer)
+                        write (buffer,'(a,a,i6.6,a)') v, '-', frame, '.ult'; open(12, file=buffer)
                 end if
+#endif
                 
                 ! in gnuplot format, all fields and frames go into a single file per curve
                 ! (to be fflush()ed every frame after all the fields are analyzed)
-                if (present(idx)) then; idx = idx + 1; DVAR(idx) = file; end if
+                if (present(idx)) then; idx = idx + 1; DVAR(idx) = v; end if
                 
                 ! output power spectrum
                 if (output$psd) then
                         call spectrum(f, S); if (present(idx)) PSD(:,idx) = S
                         
                         if (output$vis) then
+#ifdef SILO
+                                e = dbputcurve(db, STR("PSD_"//v), (/0:ns-1/)*dk, S, DB_DOUBLE, ns, DB_F77NULL, e)
+                                e = dbputcurve(db, STR("log10_PSD_"//v), log10((/1:ns-1/)*dk), log10(S(2:ns)), DB_DOUBLE, ns-1, DB_F77NULL, e)
+#else
                                 write (12,'(g)') "# PSD"
                                 do k = 1,ns; write (12,'(2g)') (k-1)*dk, S(k); end do
                                 write (12,'(g)') "", ""
@@ -454,6 +517,7 @@ subroutine dump(file, frame, t, f, idx)
                                 write (12,'(g)') "# PSD [logarithmic]"
                                 do k = 2,ns; write (12,'(2g)') log10((k-1)*dk), log10(S(k)); end do
                                 write (12,'(g)') "", ""
+#endif
                         end if
                 end if
                 
@@ -462,8 +526,15 @@ subroutine dump(file, frame, t, f, idx)
                         call sieve(f, n**3, n**2, 1)
                         P(1:n) = f(1,1,:); P(n+1) = maxval(f(:,:,n)); if (present(idx)) CDF(:,idx) = P
                         avg = sum(P)/(n+1); var = sum((P-avg)**2)/n; X = (P-avg)/sqrt(2.0*var)
+                        do k = 2,n; PDF(k) = (2.0/n)/(P(k+1)-P(k-1)); end do
                         
                         if (output$vis) then
+#ifdef SILO
+                                e = dbputcurve(db, STR("CDF_"//v), P, (/0:n/)/real(n), DB_DOUBLE, n+1, DB_F77NULL, e)
+                                e = dbputcurve(db, STR("PDF_"//v), P(2:n), PDF, DB_DOUBLE, n-1, DB_F77NULL, e)
+                                e = dbputcurve(db, STR("gaussian_CDF_"//v), P, (1.0 + erf(X))/2.0, DB_DOUBLE, n+1, DB_F77NULL, e)
+                                e = dbputcurve(db, STR("gaussian_PDF_"//v), P(2:n), exp(-X(2:n)**2)/sqrt(twopi*var), DB_DOUBLE, n-1, DB_F77NULL, e)
+#else
                                 write (12,'(g)') "# CDF"
                                 do k = 1,n+1; write (12,'(2g)') P(k), real(k-1)/n; end do
                                 write (12,'(g)') "", ""
@@ -473,16 +544,19 @@ subroutine dump(file, frame, t, f, idx)
                                 write (12,'(g)') "", ""
                                 
                                 write (12,'(g)') "# PDF"
-                                do k = 2,n; write (12,'(2g)') P(k), (2.0/n)/(P(k+1)-P(k-1)); end do
+                                do k = 2,n; write (12,'(2g)') P(k), PDF(k); end do
                                 write (12,'(g)') "", ""
                                 
                                 write (12,'(g)') "# PDF [gaussian]"
                                 do k = 2,n; write (12,'(2g)') P(k), exp(-X(k)**2)/sqrt(twopi*var); end do
                                 write (12,'(g)') "", ""
+#endif
                         end if
                 end if
                 
+#ifndef SILO
                 if (output$vis) close (12)
+#endif
         end if
 end subroutine dump
 
