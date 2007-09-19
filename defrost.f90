@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 1.16 2007/09/13 02:08:20 frolov Exp $
+! $Id: defrost.f90,v 1.17 2007/09/19 23:14:02 frolov Exp $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 -fpp defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -64,8 +64,8 @@ integer, parameter :: phi = 1, psi = 2          ! symbolic aliases for scalar fi
 integer, parameter :: rho = 1, prs = 2          ! symbolic aliases for stress-energy
 
 ! potential and its derivatives are (separately) inlined in step()
-
-! ... these will move ...
+! model summary in human-readable form is printed out in head()
+! parameters of the scalar fields potential are defined here
 real, parameter :: m2phi = 1.0, m2psi = 0.0, g2 = 100.0**2, mpl = 2.0e5
 
 ! initial conditions for homogeneous field component
@@ -80,9 +80,8 @@ real, parameter ::  ddH0 = -dphi0*ddphi0
 real :: LA(2) = (/ 1.0 - H0*dt, 1.0 /)
 real :: LH(2) = 1.0/(/ H0 - dH0*dt + ddH0*dt**2/2.0, H0 /)
 
-! ...
-character(12) DVAR(fields+3)
-real CDF(n+1,fields+3), PSD(ns,fields+3)
+! buffers holding variable names, statistics and spectra (on per-frame basis)
+character(12) DVAR(fields+3); real CDF(n+1,fields+3), PSD(ns,fields+3)
 
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -90,11 +89,14 @@ real CDF(n+1,fields+3), PSD(ns,fields+3)
 integer l
 
 ! smp array samples all fields on a 3D grid for three subsequent time slices
-real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n); complex Fk(nn,n,n)
-
 ! for larger grids, dynamically allocated array might be required
-! real, allocatable :: smp(:,:,:,:,:), tmp(:,:,:); complex, allocatable :: Fk(:,:,:)
-! allocate(smp(fields,0:p,0:p,0:p,3), tmp(n,n,n), Fk(nn,n,n))
+#ifndef DYNAMIC_ARRAYS
+real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n), bov(nx,nx,nx); complex Fk(nn,n,n)
+#else
+real, allocatable :: smp(:,:,:,:,:), tmp(:,:,:), bov(:,:,:); complex, allocatable :: Fk(:,:,:)
+allocate(smp(fields,0:p,0:p,0:p,3), tmp(n,n,n), Fk(nn,n,n))
+if (output$bov .and. nx /= n) allocate(bov(nx,nx,nx))
+#endif
 
 ! use threaded FFTW on SMP machines (link with -lfftw3_threads)
 #ifdef FFTWTHREADS
@@ -192,12 +194,14 @@ subroutine step(l, dn, hr, up, pp)
         d1 = -(1.0 - 1.5*H*dt)/d; d2 = -dt**2/d
         e1 = 1.0/(8.0*dt**2); e2 = 1.0/(4.0*(a*dx)**2*cc); e3 = e2/3.0
         
+        ! initialize accumulators
         PE = 0.0; KE = 0.0; GE = 0.0
         checkpt = mod(l-1, nt) == 0
         db = 0; idx = 0
         
+        ! discretized scalar field evolution step
+        !$omp parallel do
         do k = 1,n; do j = 1,n; do i = 1,n
-                ! discretized scalar field evolution step
                 ! scalar field potential derivatives are inlined here
                 up(:,i,j,k) = STENCIL(b,HR) + d1 * dn(:,i,j,k) + &
                     d2 * ( (m2phi + g2*hr(psi,i,j,k)**2)*V1 + (m2psi + g2*hr(phi,i,j,k)**2)*V2 ) * hr(:,i,j,k)
@@ -278,6 +282,7 @@ subroutine sample(f, gamma, m2eff)
         do k = 1,nos; ker(k) = norm * ker(k)/k; end do
         
         ! initialize 3D convolution kernel (using linear interpolation of radial profile)
+        !$omp parallel do
         do k = 1,n; do j = 1,n; do i = 1,n
                 kk = sqrt(real(i-nn)**2 + real(j-nn)**2 + real(k-nn)**2) * os; l = floor(kk)
                 
@@ -292,6 +297,7 @@ subroutine sample(f, gamma, m2eff)
         call dfftw_plan_dft_r2c_3d(plan,n,n,n,f,Fk,FFTW_ESTIMATE)
         call dfftw_execute(plan); call dfftw_destroy_plan(plan)
         
+        !$omp parallel do
         do k = 1,n; do j = 1,n
                 call random_number(a); call random_number(p)
                 Fk(:,j,k) = sqrt(-2.0*log(a)) * exp(w*p) * Fk(:,j,k)
@@ -321,6 +327,7 @@ subroutine laplace(f, rho)
         call dfftw_plan_dft_r2c_3d(plan,n,n,n,rho,Fk,FFTW_ESTIMATE)
         call dfftw_execute(plan); call dfftw_destroy_plan(plan)
         
+        !$omp parallel do
         do k = 1, n; kk = cos(w*(k-1))
         do j = 1, n; jj = cos(w*(j-1))
         do i = 1,nn; ii = cos(w*(i-1))
@@ -392,14 +399,20 @@ end subroutine sieve
 ! identify yourself
 subroutine head(fd, vars)
         integer(4) fd; character(*) :: vars(:)
-        character(512) :: buffer; integer a, b, l
-        character(*), parameter :: rev = "$Revision: 1.16 $"
+        character(512) :: buffer; integer a, b, c, l
+        character(*), parameter :: rev = "$Revision: 1.17 $"
         
+        ! behold the horror that is Fortran string parsing
         a = index(rev, ": ") + 2
-        b = index(rev, " $", .true.) - 1
+        b = index(rev, ".")
+        c = index(rev, " $", .true.) - 1
+        buffer = rev(a:b-1); read (buffer, '(i)') a
+        buffer = rev(b+1:c); read (buffer, '(i)') b
         
-        ! ID string and model summary
-        write (fd,'(3g,2(i0,g))') "# This is DEFROST revision ", rev(a:b), " (", fields, " fields, ", n, "^3 grid)"
+        ! ID string
+        write (fd,'(g,4(i0,g))') "# This is DEFROST revision ", a-1, ".", b, " (", fields, " fields, ", n, "^3 grid)"
+        
+        ! model summary
         write (fd,'(g,3(f0.5,g))') "# V(phi,psi) = ", &
                 sqrt(m2phi), "^2*phi^2/2 + ",         &
                 sqrt(m2psi), "^2*psi^2/2 + ",         &
@@ -418,10 +431,11 @@ function fopen(file, frame, t)
 
 #ifdef SILO
         integer db, opts, e
-        integer, parameter :: D = 3, zones(D) = n, nodes(D) = n+1
-        real, parameter :: x(n+1) = (/0:n/)*dx
+        integer, parameter :: D = 3, nodes(D) = nx+1
+        integer, parameter :: lut(nx) = (/0:nx-1/)*n/nx
+        real, parameter :: mesh(nx+1) = (/lut*dx,n*dx/)
         
-        character(256) :: buffer; write (buffer,'(a,a,i6.6,a)') file, '-', frame, '.silo'
+        character(256) :: buffer; write (buffer,'(a,a,i4.4,a)') file, '-', frame, '.silo'
         
         if (.not. (output$bov .or. output$vis)) return
         
@@ -433,7 +447,7 @@ function fopen(file, frame, t)
         e = dbadddopt(opts, DBOPT_DTIME, t)
         e = dbaddiopt(opts, DBOPT_COORDSYS, DB_CARTESIAN)
         
-        e = dbputqm(db, STR("mesh"), STR("x"), STR("y"), STR("z"), x, x, x, nodes, D, DB_DOUBLE, DB_COLLINEAR, opts, e)
+        e = dbputqm(db, STR("mesh"), STR("x"), STR("y"), STR("z"), mesh, mesh, mesh, nodes, D, DB_DOUBLE, DB_COLLINEAR, opts, e)
         e = dbfreeoptlist(opts)
         
         fopen = db
@@ -456,19 +470,20 @@ subroutine dump(db, v, frame, t, f, idx)
         character(*) :: v; integer db, frame, k; real t, f(n,n,n); integer, optional :: idx
         character(256) :: buffer; real avg, var, S(ns), P(n+1), X(n+1), PDF(2:n);
         
-#ifdef SILO
-        integer e; integer, parameter :: D = 3, zones(D) = n, nodes(D) = n+1
-#endif
-        
-        integer, parameter :: stride = n/nx
+        integer, parameter :: D = 3, zones(D) = nx, lut(nx) = (/0:nx-1/)*n/nx + 1; integer e
         
         ! output 3D box of values
         if (output$bov) then
 #ifdef SILO
-                e = dbputqv1(db, STR(v), STR("mesh"), f, zones, D, DB_F77NULL, 0, DB_DOUBLE, DB_ZONECENT, DB_F77NULL, e)
+                if (nx /= n) then
+                        bov = f(lut,lut,lut)
+                        e = dbputqv1(db, STR(v), STR("mesh"), bov, zones, D, DB_F77NULL, 0, DB_DOUBLE, DB_ZONECENT, DB_F77NULL, e)
+                else
+                        e = dbputqv1(db, STR(v), STR("mesh"), f, zones, D, DB_F77NULL, 0, DB_DOUBLE, DB_ZONECENT, DB_F77NULL, e)
+                end if
 #else
-                write (buffer,'(a,a,i6.6,a)') v, '-', frame, '.bov'; open(10, file=buffer)
-                write (buffer,'(a,a,i6.6,a)') v, '-', frame, '.raw'; open(11, file=buffer, form="binary")
+                write (buffer,'(a,a,i4.4,a)') v, '-', frame, '.bov'; open(10, file=buffer)
+                write (buffer,'(a,a,i4.4,a)') v, '-', frame, '.raw'; open(11, file=buffer, form="binary")
                 
                 ! BOV header
                 write (10,'(4g)') "TIME:        ", t
@@ -482,7 +497,7 @@ subroutine dump(db, v, frame, t, f, idx)
                 write (10,'(4g)') "CENTERING:       ", "zonal"
                 
                 ! raw data
-                if (stride > 1) then; do k=1,n,stride; write (11) f(::stride,::stride,k); end do; else; write (11) f; end if
+                if (nx /= n) then; bov = f(lut,lut,lut); write (11) bov; else; write (11) f; end if
                 
                 close (10); close (11)
 #endif
@@ -493,7 +508,7 @@ subroutine dump(db, v, frame, t, f, idx)
 #ifndef SILO
                 ! in VisIt format, all curves go into a single file per field, per frame
                 if (output$vis) then
-                        write (buffer,'(a,a,i6.6,a)') v, '-', frame, '.ult'; open(12, file=buffer)
+                        write (buffer,'(a,a,i4.4,a)') v, '-', frame, '.ult'; open(12, file=buffer)
                 end if
 #endif
                 
