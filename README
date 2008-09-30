@@ -6,7 +6,7 @@ D E F R O S T   ---   R E A D M E
 
 ! Copyright (C) 2007 Andrei Frolov <frolov@sfu.ca>
 ! Distributed under the terms of the GNU General Public License
-! If you use this code for your research, please cite hep-../...
+! If you use this code for your research, please cite arXiv:0809.4904
 
 Included in this distribution are:
 	
@@ -108,7 +108,7 @@ memory bandwidth speed. If array access pattern stride is commensurate
 with cache page size, memory access performance can be affected (this is
 known as "cache thrashing"). In the worst case, the effect can be as
 much as 2x slowdown. Padding array by a few empty elements avoids it.
-Try getting p+1 prime, or a product of a few large primes.
+Try setting p+1 prime, or a product of a few large primes.
 
 DEFROST has flexible output options and lazy calculation policy (only
 stuff you want gets calculated). Disabling unneeded output can save
@@ -161,7 +161,7 @@ plot 'LOG' using 1:2 with lines			# expansion history
 plot 'LOG' using 1:($5/$4) with lines		# equation of state
 plot 'LOG' using 1:(($4/3-$3**2)*$2**2) w l	# flatness violation
 
-plot 'PSD' i 0:512:16 u 2:((10**$3)*$2**3) w l	# inflaton spectra
+plot 'PSD' i 0:512:16 u 2:((10**$3)*$2**4) w l	# inflaton spectra
 
 2) 3D VISUALIZATIONS:
 
