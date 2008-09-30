@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 1.17 2007/09/19 23:14:02 frolov Exp $
+! $Id: defrost.f90,v 2.0 2008/09/30 01:23:01 frolov Stab $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 -fpp defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -6,7 +6,7 @@
 
 ! Copyright (C) 2007 Andrei Frolov <frolov@sfu.ca>
 ! Distributed under the terms of the GNU General Public License
-! If you use this code for your research, please cite hep-../...
+! If you use this code for your research, please cite arXiv:0809.4904
 
 program defrost; implicit none
 
@@ -400,7 +400,7 @@ end subroutine sieve
 subroutine head(fd, vars)
         integer(4) fd; character(*) :: vars(:)
         character(512) :: buffer; integer a, b, c, l
-        character(*), parameter :: rev = "$Revision: 1.17 $"
+        character(*), parameter :: rev = "$Revision: 2.0 $"
         
         ! behold the horror that is Fortran string parsing
         a = index(rev, ": ") + 2
@@ -419,7 +419,7 @@ subroutine head(fd, vars)
                 sqrt(g2), "^2*phi^2*psi^2/2"
         
         ! variable list
-        write (buffer,'(g,g12.12",",8(g24.12","))') "OUTPUT:", adjustr(vars); l = index(buffer, ',', .true.);
+        write (buffer,'(g,g12.12",",32(g24.12","))') "OUTPUT:", adjustr(vars); l = index(buffer, ',', .true.);
         write (fd,'(2g)') "# ", repeat('=', l)
         write (fd,'(2g)') "# ", buffer(1:l-1)//';'
         write (fd,'(2g)') "# ", repeat('=', l)
@@ -587,7 +587,7 @@ subroutine fflush(t, idx)
                         open(31, file="PSD"); call head(31, (/"t", "k", DVAR(1:idx)/))
                 end if
                 
-                do k = 1,ns; write (31,'(12g)') t, (k-1)*dk, log10(PSD(k,1:idx)); end do
+                do k = 1,ns; write (31,'(32g)') t, (k-1)*dk, log10(PSD(k,1:idx)); end do
                 write (31,'(g)') "", ""; flush(31)
         end if
         
@@ -599,7 +599,7 @@ subroutine fflush(t, idx)
                         open(32, file="CDF"); call head(32, (/"t", "percentile", DVAR(1:idx)/))
                 end if
                 
-                do k = 1,n+1; write (32,'(12g)') t, real(k-1)/n, CDF(k,1:idx); end do
+                do k = 1,n+1; write (32,'(32g)') t, real(k-1)/n, CDF(k,1:idx); end do
                 write (32,'(g)') "", ""; flush(32)
         end if
 end subroutine fflush
