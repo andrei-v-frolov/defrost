@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 2.0 2008/09/30 01:23:01 frolov Stab $
+! $Id: defrost.f90,v 2.1 2009/01/22 03:50:18 frolov Stab $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 -fpp defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -91,9 +91,13 @@ integer l
 ! smp array samples all fields on a 3D grid for three subsequent time slices
 ! for larger grids, dynamically allocated array might be required
 #ifndef DYNAMIC_ARRAYS
-real smp(fields,0:p,0:p,0:p,3), tmp(n,n,n), bov(nx,nx,nx); complex Fk(nn,n,n)
+real smp(fields,0:p,0:p,0:p,3)
+real(8) tmp(n,n,n), bov(nx,nx,nx)
+complex(8) Fk(nn,n,n)
 #else
-real, allocatable :: smp(:,:,:,:,:), tmp(:,:,:), bov(:,:,:); complex, allocatable :: Fk(:,:,:)
+real, allocatable :: smp(:,:,:,:,:)
+real(8), allocatable :: tmp(:,:,:), bov(:,:,:)
+complex(8), allocatable :: Fk(:,:,:)
 allocate(smp(fields,0:p,0:p,0:p,3), tmp(n,n,n), Fk(nn,n,n))
 if (output$bov .and. nx /= n) allocate(bov(nx,nx,nx))
 #endif
@@ -261,14 +265,14 @@ end subroutine step
 
 ! sample Gaussian random field with power-law spectrum
 subroutine sample(f, gamma, m2eff)
-        real f(n,n,n), gamma, m2eff; integer*8 plan
+        real(8) f(n,n,n); real gamma, m2eff; integer(8) plan
         
         integer, parameter :: os = 16, nos = n * os**2
         real, parameter :: dxos = dx/os, dkos = dk/(2*os), kcut = nn*dk/2.0
         real, parameter :: norm = 0.5/(n**3 * (twopi*dk**3)**0.5 * mpl) * (dkos/dxos)
         complex, parameter :: w = (0.0, twopi)
         
-        real ker(nos), a(nn), p(nn)
+        real(8) ker(nos); real a(nn), p(nn)
         integer i, j, k, l; real kk
         
         ! calculate (oversampled) radial profile of convolution kernel
@@ -309,7 +313,7 @@ end subroutine sample
 
 ! solve Laplace equation $\Delta f = \rho$
 subroutine laplace(f, rho)
-        real f(n,n,n), rho(n,n,n); integer*8 plan
+        real(8) f(n,n,n), rho(n,n,n); integer(8) plan
         integer i, j, k; real :: ii, jj, kk
         
         real, parameter :: w = twopi/n
@@ -342,7 +346,7 @@ end subroutine laplace
 
 ! one-sided power spectrum density estimator
 subroutine spectrum(f, S)
-        real f(n,n,n), S(ns), W(ns); integer*8 plan
+        real(8) f(n,n,n), S(ns), W(ns); integer(8) plan
         integer i, j, k, ii, jj, kk, l; real p, c(2)
         
         call dfftw_plan_dft_r2c_3d(plan,n,n,n,f,Fk,FFTW_ESTIMATE)
@@ -369,7 +373,7 @@ end subroutine spectrum
 
 ! partially sort an array, finding (r:n:m)th smallest elements
 recursive subroutine sieve(f, n, m, r)
-        integer i, j, k, n, m, r; real p, f(n)
+        integer i, j, k, n, m, r; real(8) p, f(n)
         
         if (r > n) return
         
@@ -400,7 +404,7 @@ end subroutine sieve
 subroutine head(fd, vars)
         integer(4) fd; character(*) :: vars(:)
         character(512) :: buffer; integer a, b, c, l
-        character(*), parameter :: rev = "$Revision: 2.0 $"
+        character(*), parameter :: rev = "$Revision: 2.1 $"
         
         ! behold the horror that is Fortran string parsing
         a = index(rev, ": ") + 2
@@ -433,7 +437,7 @@ function fopen(file, frame, t)
         integer db, opts, e
         integer, parameter :: D = 3, nodes(D) = nx+1
         integer, parameter :: lut(nx) = (/0:nx-1/)*n/nx
-        real, parameter :: mesh(nx+1) = (/lut*dx,n*dx/)
+        real(8), parameter :: mesh(nx+1) = (/lut*dx,n*dx/)
         
         character(256) :: buffer; write (buffer,'(a,a,i4.4,a)') file, '-', frame, '.silo'
         
@@ -444,7 +448,7 @@ function fopen(file, frame, t)
         
         e = dbmkoptlist(3, opts)
         e = dbaddiopt(opts, DBOPT_CYCLE, frame)
-        e = dbadddopt(opts, DBOPT_DTIME, t)
+        e = dbadddopt(opts, DBOPT_DTIME, real(t,kind=8))
         e = dbaddiopt(opts, DBOPT_COORDSYS, DB_CARTESIAN)
         
         e = dbputqm(db, STR("mesh"), STR("x"), STR("y"), STR("z"), mesh, mesh, mesh, nodes, D, DB_DOUBLE, DB_COLLINEAR, opts, e)
@@ -467,8 +471,11 @@ end subroutine fclose
 
 ! output field configuration and its aggregates
 subroutine dump(db, v, frame, t, f, idx)
-        character(*) :: v; integer db, frame, k; real t, f(n,n,n); integer, optional :: idx
-        character(256) :: buffer; real avg, var, S(ns), P(n+1), X(n+1), PDF(2:n);
+        character(*) :: v; integer db, frame, k; real t; real(8) f(n,n,n); integer, optional :: idx
+        
+        character(256) :: buffer
+        real(8) S(ns), C(n+1), PDF(n+1), X(n+1), Y(n+1), Z(n+1), avg, var
+        real(8), parameter :: Q(ns) = (/0:ns-1/)*dk, P(n+1) = (/0:n/)/real(n)
         
         integer, parameter :: D = 3, zones(D) = nx, lut(nx) = (/0:nx-1/)*n/nx + 1; integer e
         
@@ -522,15 +529,15 @@ subroutine dump(db, v, frame, t, f, idx)
                         
                         if (output$vis) then
 #ifdef SILO
-                                e = dbputcurve(db, STR("PSD_"//v), (/0:ns-1/)*dk, S, DB_DOUBLE, ns, DB_F77NULL, e)
-                                e = dbputcurve(db, STR("log10_PSD_"//v), log10((/1:ns-1/)*dk), log10(S(2:ns)), DB_DOUBLE, ns-1, DB_F77NULL, e)
+                                e = dbputcurve(db, STR("PSD_"//v), Q, S, DB_DOUBLE, ns, DB_F77NULL, e)
+                                e = dbputcurve(db, STR("log10_PSD_"//v), log10(Q(2:ns)), log10(S(2:ns)), DB_DOUBLE, ns-1, DB_F77NULL, e)
 #else
                                 write (12,'(g)') "# PSD"
-                                do k = 1,ns; write (12,'(2g)') (k-1)*dk, S(k); end do
+                                do k = 1,ns; write (12,'(2g)') Q(k), S(k); end do
                                 write (12,'(g)') "", ""
                                 
                                 write (12,'(g)') "# PSD [logarithmic]"
-                                do k = 2,ns; write (12,'(2g)') log10((k-1)*dk), log10(S(k)); end do
+                                do k = 2,ns; write (12,'(2g)') log10(Q(k)), log10(S(k)); end do
                                 write (12,'(g)') "", ""
 #endif
                         end if
@@ -539,31 +546,34 @@ subroutine dump(db, v, frame, t, f, idx)
                 ! output distribution of values
                 if (output$cdf) then
                         call sieve(f, n**3, n**2, 1)
-                        P(1:n) = f(1,1,:); P(n+1) = maxval(f(:,:,n)); if (present(idx)) CDF(:,idx) = P
-                        avg = sum(P)/(n+1); var = sum((P-avg)**2)/n; X = (P-avg)/sqrt(2.0*var)
-                        do k = 2,n; PDF(k) = (2.0/n)/(P(k+1)-P(k-1)); end do
+                        C(1:n) = f(1,1,:); C(n+1) = maxval(f(:,:,n)); if (present(idx)) CDF(:,idx) = C
+                        PDF = 0.0; do k = 2,n; PDF(k) = (2.0/n)/(C(k+1)-C(k-1)); end do; if (oscale) PDF = PDF/maxval(PDF)
+                        
+                        ! this really should be replaced by a most likelihood fit of a gaussian distribution
+                        avg = sum(C(2:n))/(n-1); var = sum((C(2:n)-avg)**2)/(n-2); X = (C-avg)/sqrt(2.0*var)
+                        Y = (1.0 + erf(X))/2.0; Z = exp(-X**2); if (.not. oscale) Z = Z/sqrt(twopi*var)
                         
                         if (output$vis) then
 #ifdef SILO
-                                e = dbputcurve(db, STR("CDF_"//v), P, (/0:n/)/real(n), DB_DOUBLE, n+1, DB_F77NULL, e)
-                                e = dbputcurve(db, STR("PDF_"//v), P(2:n), PDF, DB_DOUBLE, n-1, DB_F77NULL, e)
-                                e = dbputcurve(db, STR("gaussian_CDF_"//v), P, (1.0 + erf(X))/2.0, DB_DOUBLE, n+1, DB_F77NULL, e)
-                                e = dbputcurve(db, STR("gaussian_PDF_"//v), P(2:n), exp(-X(2:n)**2)/sqrt(twopi*var), DB_DOUBLE, n-1, DB_F77NULL, e)
+                                e = dbputcurve(db, STR("CDF_"//v), C, P, DB_DOUBLE, n+1, DB_F77NULL, e)
+                                e = dbputcurve(db, STR("PDF_"//v), C, PDF, DB_DOUBLE, n+1, DB_F77NULL, e)
+                                e = dbputcurve(db, STR("gaussian_CDF_"//v), C, Y, DB_DOUBLE, n+1, DB_F77NULL, e)
+                                e = dbputcurve(db, STR("gaussian_PDF_"//v), C, Z, DB_DOUBLE, n+1, DB_F77NULL, e)
 #else
                                 write (12,'(g)') "# CDF"
-                                do k = 1,n+1; write (12,'(2g)') P(k), real(k-1)/n; end do
-                                write (12,'(g)') "", ""
-                                
-                                write (12,'(g)') "# CDF [gaussian]"
-                                do k = 1,n+1; write (12,'(2g)') P(k), (1.0 + erf(X(k)))/2.0; end do
+                                do k = 1,n+1; write (12,'(2g)') C(k), P(k); end do
                                 write (12,'(g)') "", ""
                                 
                                 write (12,'(g)') "# PDF"
-                                do k = 2,n; write (12,'(2g)') P(k), PDF(k); end do
+                                do k = 1,n+1; write (12,'(2g)') C(k), PDF(k); end do
+                                write (12,'(g)') "", ""
+                                
+                                write (12,'(g)') "# CDF [gaussian]"
+                                do k = 1,n+1; write (12,'(2g)') C(k), Y(k); end do
                                 write (12,'(g)') "", ""
                                 
                                 write (12,'(g)') "# PDF [gaussian]"
-                                do k = 2,n; write (12,'(2g)') P(k), exp(-X(k)**2)/sqrt(twopi*var); end do
+                                do k = 1,n+1; write (12,'(2g)') C(k), Z(k); end do
                                 write (12,'(g)') "", ""
 #endif
                         end if

@@ -70,9 +70,13 @@ parallelism, so the support for it was dropped. Compiling with other
 Fortran compilers should be possible, but was not tested.
 
 Adjust FFLAGS to optimize for your machine (in particular, -x flag
-selects target CPU). As DEFROST uses Fortran preprocessor, -fpp flag
-is necessary for it to compile. Real numbers must be set to double
-precision (-r8 flag), or the bindings to FFTW and SILO will break.
+selects target CPU). As DEFROST uses Fortran preprocessor, -fpp flag is
+necessary for it to compile. Floating point numbers are set to double
+precision by default (-r8 flag), but the code can be compiled for single
+precision (-r4) to decrease memory footprint, or quad precision (-r16)
+to improve roundoff errors (at 10x runtime penalty). Regardless of
+solver precision, the bindings to FFTW and SILO will use double
+precision floats.
 
 DEFROST solver code is fully parallel, and can be build as such using
 either automatic parallelizer (-parallel) or OpenMP (-openmp). Automatic
