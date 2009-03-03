@@ -1,4 +1,4 @@
-! $Id: defrost.f90,v 2.1 2009/01/22 03:50:18 frolov Stab $
+! $Id: defrost.f90,v 2.1.1.1 2009/03/03 02:28:01 frolov Stab $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 -fpp defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
@@ -26,18 +26,18 @@ real, parameter :: sqrt3 = 1.7320508075688772935274463415059
 ! solver control parameters
 integer, parameter :: n = 256                   ! sampled grid size (simulation cube is n^3 pts)
 integer, parameter :: p = n+2                   ! padded grid size (>n, adjust for cache efficiency)
-integer, parameter :: tt = 2**18                ! total number of time steps to take (i.e. runtime)
+integer, parameter :: tt = 2**14                ! total number of time steps to take (i.e. runtime)
 integer, parameter :: nn = n/2+1                ! Nyquist frequency (calculated, leave it alone)
 integer, parameter :: ns = sqrt3*(n/2) + 2      ! highest wavenumber on 3D grid (leave it alone)
 
-real, parameter :: alpha = 40.0                 ! dx/dt (be careful not to violate Courant condition)
+real, parameter :: alpha = 5.0                  ! dx/dt (be careful not to violate Courant condition)
 real, parameter :: dx = 10.0/n                  ! grid spacing   (physical grid size is n*dx)
 real, parameter :: dt = dx/alpha                ! time step size (simulated timespan is tt*dt)
 real, parameter :: dk = twopi/(n*dx)            ! frequency domain grid spacing (leave it alone)
 
 ! output control parameters
 integer, parameter :: nx = n/2                  ! spatial grid is downsampled to nx^3 pts for output
-integer, parameter :: nt = 2**9                 ! simulation will be logged every nt time steps
+integer, parameter :: nt = 2**5                 ! simulation will be logged every nt time steps
 
 logical, parameter :: output = .true.           ! set this to false to disable all file output at once
 logical, parameter :: oscale = .true.           ! scale output variables to counter-act expansion
@@ -66,18 +66,18 @@ integer, parameter :: rho = 1, prs = 2          ! symbolic aliases for stress-en
 ! potential and its derivatives are (separately) inlined in step()
 ! model summary in human-readable form is printed out in head()
 ! parameters of the scalar fields potential are defined here
-real, parameter :: m2phi = 1.0, m2psi = 0.0, g2 = 100.0**2, mpl = 2.0e5
+real, parameter :: lambda = 1.0, g2 = 1.875, mpl = 1.0e7/3.0
 
 ! initial conditions for homogeneous field component
-real, parameter ::  phi0 =  1.0093430384226378929425913902459
-real, parameter :: dphi0 = -0.7137133070120812430962278466136
-real, parameter ::    H0 =  0.5046715192113189464712956951230
-real, parameter ::   dH0 = -H0**2
-real, parameter :: ddphi0 = -(3.0*H0*dphi0 + m2phi*phi0)
+real, parameter ::  phi0 =  2.3393837654714997732962993666073
+real, parameter :: dphi0 = -2.7363582010758065274616992909302
+real, parameter ::    H0 =  1.9348974397361251388968698880012
+real, parameter ::   dH0 =  0.0
+real, parameter :: ddphi0 = -(2.0*H0*dphi0 + lambda*phi0**3)
 real, parameter ::  ddH0 = -dphi0*ddphi0
 
 ! scale factor and horizon size (sampled on two subsequent time slices)
-real :: LA(2) = (/ 1.0 - H0*dt, 1.0 /)
+real :: LA(2) = (/ exp(-H0*dt), 1.0 /)
 real :: LH(2) = 1.0/(/ H0 - dH0*dt + ddH0*dt**2/2.0, H0 /)
 
 ! buffers holding variable names, statistics and spectra (on per-frame basis)
@@ -139,8 +139,8 @@ end subroutine wrap
 subroutine init(dn, hr)
         real, dimension(fields,0:p,0:p,0:p) :: dn, hr
         
-        real, parameter :: m2phi$eff = m2phi - 2.25*H0**2
-        real, parameter :: m2psi$eff = m2psi + g2*phi0**2 - 2.25*H0**2
+        real, parameter :: m2phi$eff = 3.0*lambda*phi0**2 - 2.25*H0**2
+        real, parameter :: m2psi$eff = g2*phi0**2 - 2.25*H0**2
         
         call sample(tmp, -0.25, m2phi$eff); hr(phi,1:n,1:n,1:n) = tmp + phi0
         call sample(tmp, -0.25, m2psi$eff); hr(psi,1:n,1:n,1:n) = tmp
@@ -181,7 +181,7 @@ subroutine step(l, dn, hr, up, pp)
         real, dimension(n) :: V, T, G, PE, KE, GE
         
         ! various evolution operator coefficients
-        real c, d, b0, b1, b2, b3, d1, d2, e1, e2, e3
+        real c, d, b0, b1, b2, b3, d1, d2, e1, e2, e3, e4
         
         ! optional computations flags
         logical, parameter :: dumping = output .and. (output$bov .or. output$crv)
@@ -193,10 +193,10 @@ subroutine step(l, dn, hr, up, pp)
         real a, H, Q, R; a = LA(2); H = 1.0/LH(2)
         
         ! all coefficients inside the loop are pre-calculated here
-        d = 1.0 + 1.5*H*dt; c = cc * alpha**2 * a**2 * d
+        d = 1.0 + H*dt; c = cc * alpha**2 * d
         b0 = 2.0/d + c0/c; b1 = c1/c; b2 = c2/c; b3 = c3/c
-        d1 = -(1.0 - 1.5*H*dt)/d; d2 = -dt**2/d
-        e1 = 1.0/(8.0*dt**2); e2 = 1.0/(4.0*(a*dx)**2*cc); e3 = e2/3.0
+        d1 = -(1.0 - H*dt)/d; d2 = -(a*dt)**2/d
+        e1 = 1.0/(4.0*dt**2); e2 = 1.0/(4.0*dx**2*cc); e3 = e2/3.0; e4 = a**2/4.0
         
         ! initialize accumulators
         PE = 0.0; KE = 0.0; GE = 0.0
@@ -208,21 +208,22 @@ subroutine step(l, dn, hr, up, pp)
         do k = 1,n; do j = 1,n; do i = 1,n
                 ! scalar field potential derivatives are inlined here
                 up(:,i,j,k) = STENCIL(b,HR) + d1 * dn(:,i,j,k) + &
-                    d2 * ( (m2phi + g2*hr(psi,i,j,k)**2)*V1 + (m2psi + g2*hr(phi,i,j,k)**2)*V2 ) * hr(:,i,j,k)
+                    d2 * ((lambda*hr(phi,i,j,k)**2 + g2*hr(psi,i,j,k)**2) * V1 + g2*hr(phi,i,j,k)**2 * V2) * hr(:,i,j,k)
                 
-                ! scalar field potential multiplied by 2 is inlined here
-                V(k) = (m2phi + g2*hr(psi,i,j,k)**2)*hr(phi,i,j,k)**2 + m2psi*hr(psi,i,j,k)**2
-                T(k) = sum((up(:,i,j,k)-dn(:,i,j,k))**2)
+                ! scalar field potential multiplied by 4 is inlined here
+                V(k) = (lambda * hr(phi,i,j,k)**2 + (2.0*g2) * hr(psi,i,j,k)**2) * hr(phi,i,j,k)**2
+                T(k) = sum((up(:,i,j,k)-hr(:,i,j,k))**2) + sum((hr(:,i,j,k)-dn(:,i,j,k))**2)
+                G(k) = STENCIL(c,GRAD2)
                 
-                PE(k) = PE(k) + V(k); KE(k) = KE(k) + T(k)
+                PE(k) = PE(k) + V(k)
+                KE(k) = KE(k) + T(k)
+                GE(k) = GE(k) + G(k)
                 
                 ! calculate density and pressure when needed
                 if (checkpt) then
-                        G(k) = STENCIL(c,GRAD2); GE(k) = GE(k) + G(k)
-                        
                         if (needTii) then
-                                pp(rho,i,j,k) = e1*T(k) + e2*G(k) + 0.5*V(k)
-                                pp(prs,i,j,k) = e1*T(k) - e3*G(k) - 0.5*V(k)
+                                pp(rho,i,j,k) = e1*T(k) + e2*G(k) + e4*V(k)
+                                pp(prs,i,j,k) = e1*T(k) - e3*G(k) - e4*V(k)
                         end if
                 end if
         end do; end do; end do
@@ -231,18 +232,17 @@ subroutine step(l, dn, hr, up, pp)
         call wrap(up)
         
         ! update expansion factors
-        Q = sum(4.0*e1*KE - PE)/(6.0*n**3)
-        R = LH(1) + (1.0 + Q * LH(2)**2) * dt
-        LH = (/ LH(2), LH(1) + (1.0 + Q * R**2) * (2.0*dt) /)
+        Q = sum(2.0*e4*PE + e2*GE - e1*KE)/(3.0*n**3)
+        LH = (/ LH(2), LH(1) + (1.0 - Q * LH(2)**2) * (2.0*dt) /)
         LA = (/ LA(2), LA(1) + (H*a) * (2.0*dt) /)
         
         ! dump simulation data
         if (checkpt) then
-                write (*,'(5g)') (l-1)*dt, a, H, sum(e1*KE + e2*GE + 0.5*PE)/n**3, sum(e1*KE - e3*GE - 0.5*PE)/n**3
+                write (*,'(5g)') (l-1)*dt, a, H, sum(e1*KE + e2*GE + e4*PE)/n**3, sum(e1*KE - e3*GE - e4*PE)/n**3
                 
                 if (dumping .and. output$any) db = fopen("frame", (l-1)/nt, (l-1)*dt)
                 if (dumping .and. output$fld) then
-                        Q = 1.0; if (oscale) Q = a**1.5
+                        Q = 1.0; if (oscale) Q = a
                         tmp = Q*hr(phi,1:n,1:n,1:n); call dump(db, "phi", (l-1)/nt, (l-1)*dt, tmp, idx)
                         tmp = Q*hr(psi,1:n,1:n,1:n); call dump(db, "psi", (l-1)/nt, (l-1)*dt, tmp, idx)
                 end if
@@ -252,7 +252,7 @@ subroutine step(l, dn, hr, up, pp)
                         tmp = Q*pp(prs,1:n,1:n,1:n); call dump(db, "prs", (l-1)/nt, (l-1)*dt, tmp, idx)
                 end if
                 if (dumping .and. output$pot) then
-                        Q = a**2/2.0; tmp = Q*pp(rho,1:n,1:n,1:n)
+                        tmp = 0.5*pp(rho,1:n,1:n,1:n)
                         call laplace(tmp, tmp); call dump(db, "PSI", (l-1)/nt, (l-1)*dt, tmp, idx)
                 end if
                 if (idx > 0 .and. output$gnu) call fflush((l-1)*dt, idx)
@@ -404,7 +404,7 @@ end subroutine sieve
 subroutine head(fd, vars)
         integer(4) fd; character(*) :: vars(:)
         character(512) :: buffer; integer a, b, c, l
-        character(*), parameter :: rev = "$Revision: 2.1 $"
+        character(*), parameter :: rev = "$Revision: 2.1.1.1 $"
         
         ! behold the horror that is Fortran string parsing
         a = index(rev, ": ") + 2
@@ -417,10 +417,7 @@ subroutine head(fd, vars)
         write (fd,'(g,4(i0,g))') "# This is DEFROST revision ", a-1, ".", b, " (", fields, " fields, ", n, "^3 grid)"
         
         ! model summary
-        write (fd,'(g,3(f0.5,g))') "# V(phi,psi) = ", &
-                sqrt(m2phi), "^2*phi^2/2 + ",         &
-                sqrt(m2psi), "^2*psi^2/2 + ",         &
-                sqrt(g2), "^2*phi^2*psi^2/2"
+        write (fd,'(g,3(f0.5,g))') "# V(phi,psi) = ", lambda, "/4 * phi^4 + ", g2, "/2 phi^2 psi^2"
         
         ! variable list
         write (buffer,'(g,g12.12",",32(g24.12","))') "OUTPUT:", adjustr(vars); l = index(buffer, ',', .true.);
