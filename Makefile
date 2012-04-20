@@ -1,23 +1,29 @@
 ################################################################
-# $Id: Makefile,v 1.2 2007/09/19 23:14:02 frolov Exp $
+# $Id: Makefile,v 1.3 2012/04/20 23:19:39 frolov Stab $
 # DEFROST Makefile (Intel Fortran compiler)
 ################################################################
 
 # Fortran compiler (adjust for your machine, -r8 and -fpp are mandatory)
 FC = ifort
-FFLAGS = -O3 -ipo -xT -r8 -pc80 -fpp -parallel
+FFLAGS = -xT -O3 -ipo -r8 -pc80 -fpp
 LDFLAGS = -static-intel
+
+# Uncomment for parallel build
+THREADS = 4
 
 # Uncomment to use dynamically allocated arrays
 # FFLAGS += -DDYNAMIC_ARRAYS
 
+# Changing memory model might be advisable instead
+# FFLAGS += -mcmodel=large
+# LDFLAGS = -shared-intel
+
 # FFTW library (set THREADS for threaded FFTW)
-THREADS = 4
 FFTWINC = 
 FFTWLIB = -lfftw3
 
 ifdef THREADS
-FFLAGS += -DFFTWTHREADS=$(THREADS)
+FFLAGS += -parallel -DTHREADS=$(THREADS)
 FFTWLIB += -lfftw3_threads
 endif
 
@@ -25,7 +31,7 @@ endif
 SILO = 1
 
 ifdef SILO
-SILOINC = 
+SILOINC = -I/usr/local/include
 SILOLIB = -L/usr/local/lib64 -lsilo -lhdf5
 
 FFLAGS += -DSILO
