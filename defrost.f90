@@ -1,10 +1,10 @@
-! $Id: defrost.f90,v 2.1 2009/01/22 03:50:18 frolov Stab $
+! $Id: defrost.f90,v 3.0 2012/04/21 09:36:43 frolov Exp $
 ! [compile with: ifort -O3 -ipo -xT -r8 -pc80 -fpp defrost.f90 -lfftw3]
 
 ! Reheating code doing something...
 ! http://www.sfu.ca/physics/cosmology/defrost
 
-! Copyright (C) 2007 Andrei Frolov <frolov@sfu.ca>
+! Copyright (C) 2007-2012 Andrei Frolov <frolov@sfu.ca>
 ! Distributed under the terms of the GNU General Public License
 ! If you use this code for your research, please cite arXiv:0809.4904
 
@@ -18,26 +18,52 @@ include "silo.inc"
 
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Preheating model
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-! some useful constants
-real, parameter :: twopi = 6.2831853071795864769252867665590
-real, parameter :: sqrt3 = 1.7320508075688772935274463415059
+! fields are referred to by their symbolic aliases
+integer, parameter :: fields = 2                ! total number of scalar fields being evolved
+integer, parameter :: phi = 1, psi = 2          ! symbolic aliases for scalar field components
+
+! parameters of the scalar field potential are defined here
+real, parameter :: lambda = 1.0, g2 = 1.875, mpl = 1.0e7/3.0
+
+! potential and its derivatives are inlined in ...step() routines
+#define Vx4(PHI,PSI) (lambda * (PHI)**2 + (2.0*g2) * (PSI)**2) * (PHI)**2
+#define M2I(PHI,PSI) VECTOR(lambda*(PHI)**2 + g2*(PSI)**2, g2*(PHI)**2)
+
+! model summary in human-readable form is printed out in head()
+#define VTAG "# V(phi,psi) = ", lambda, "/4 * phi^4 + ", g2, "/2 phi^2 psi^2"
+
+! initial conditions for homogeneous field components
+real, parameter ::  phi0 =  2.339383796213256
+real, parameter :: dphi0 = -2.736358272992573
+real, parameter ::    H0 =  1.934897490588959
+
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Configurable parameters
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+! some useful constants (in quad precision)
+real, parameter :: twopi = 6.28318530717958647692528676655900577
+real, parameter :: sqrt3 = 1.73205080756887729352744634150587237
 
 ! solver control parameters
 integer, parameter :: n = 256                   ! sampled grid size (simulation cube is n^3 pts)
-integer, parameter :: p = n+2                   ! padded grid size (>n, adjust for cache efficiency)
-integer, parameter :: tt = 2**18                ! total number of time steps to take (i.e. runtime)
+integer, parameter :: m = n+2                   ! padded grid size (>n, adjust for cache efficiency)
+integer, parameter :: tt = 2**13                ! total number of time steps to take (i.e. runtime)
 integer, parameter :: nn = n/2+1                ! Nyquist frequency (calculated, leave it alone)
 integer, parameter :: ns = sqrt3*(n/2) + 2      ! highest wavenumber on 3D grid (leave it alone)
 
-real, parameter :: alpha = 40.0                 ! dx/dt (be careful not to violate Courant condition)
+real, parameter :: alpha = 2.5                  ! dx/dt (be careful not to violate Courant condition)
 real, parameter :: dx = 10.0/n                  ! grid spacing   (physical grid size is n*dx)
 real, parameter :: dt = dx/alpha                ! time step size (simulated timespan is tt*dt)
 real, parameter :: dk = twopi/(n*dx)            ! frequency domain grid spacing (leave it alone)
 
 ! output control parameters
 integer, parameter :: nx = n/2                  ! spatial grid is downsampled to nx^3 pts for output
-integer, parameter :: nt = 2**9                 ! simulation will be logged every nt time steps
+integer, parameter :: nt = 2**4                 ! simulation will be logged every nt time steps
 
 logical, parameter :: output = .true.           ! set this to false to disable all file output at once
 logical, parameter :: oscale = .true.           ! scale output variables to counter-act expansion
@@ -46,10 +72,11 @@ logical, parameter :: output$bov = .false.      ! output 3D data cube (storage-e
 logical, parameter :: output$psd = .true.       ! output power spectra (time-expensive)
 logical, parameter :: output$cdf = .true.       ! output distributions (time-expensive)
 
-logical, parameter :: output$fld = .true.       ! output scalar fields
-logical, parameter :: output$set = .true.       ! output stress-energy tensor components
+logical, parameter :: output$fld = .true.       ! output scalar field values
+logical, parameter :: output$vel = .false.      ! output scalar field velocities
+logical, parameter :: output$rho = .true.       ! output total energy density
+logical, parameter :: output$prs = .true.       ! output isotropic pressure
 logical, parameter :: output$pot = .true.       ! output gravitatinal potential (expensive)
-logical, parameter :: output$any = output$fld .or. output$set .or. output$pot
 
 logical, parameter :: output$gnu = .true.       ! output curves in gnuplot format (sinle file)
 logical, parameter :: output$vis = .false.      ! output curves in VisIt X-Y format (per frame)
@@ -57,78 +84,99 @@ logical, parameter :: output$crv = (output$psd .or. output$cdf) .and. (output$gn
 
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Numerical scheme
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-! fields are referred to by their symbolic aliases
-integer, parameter :: fields = 2                ! total number of scalar fields being evolved
-integer, parameter :: phi = 1, psi = 2          ! symbolic aliases for scalar fields
-integer, parameter :: rho = 1, prs = 2          ! symbolic aliases for stress-energy
+! time integration is now symplectic, scheme order can be adjusted
+! unless you have specific reasons to, stick to the 6-th order one
+integer, parameter :: order = 6 ! integrator order (should be even)
 
-! potential and its derivatives are (separately) inlined in step()
-! model summary in human-readable form is printed out in head()
-! parameters of the scalar fields potential are defined here
-real, parameter :: m2phi = 1.0, m2psi = 0.0, g2 = 100.0**2, mpl = 2.0e5
+! higher order symplectic integrator schedules (these are magical, don't touch)
+real, parameter :: W6A(0:3) = (/ 1.31518632068391121888424972823886251, -1.17767998417887100694641568096431573, &
+                                 0.235573213359358133684793182978534602, 0.784513610477557263819497633866349876 /)
 
-! initial conditions for homogeneous field component
-real, parameter ::  phi0 =  1.0093430384226378929425913902459
-real, parameter :: dphi0 = -0.7137133070120812430962278466136
-real, parameter ::    H0 =  0.5046715192113189464712956951230
-real, parameter ::   dH0 = -H0**2
-real, parameter :: ddphi0 = -(3.0*H0*dphi0 + m2phi*phi0)
-real, parameter ::  ddH0 = -dphi0*ddphi0
+! Laplacian operator stencils: traditional one and three isotropic variants
+! stable for dx/dt > sqrt(3), sqrt(2), sqrt(21)/3, and 8/sqrt(30) respectively
+! computational cost difference is insignificant for large grids
 
-! scale factor and horizon size (sampled on two subsequent time slices)
-real :: LA(2) = (/ 1.0 - H0*dt, 1.0 /)
-real :: LH(2) = 1.0/(/ H0 - dH0*dt + ddH0*dt**2/2.0, H0 /)
+!character, parameter :: scheme = 'N'; real, parameter :: c3 = 0.0, c2 = 0.0, c1 = 1.0, c0 = -6.0, cc = 1.0
+!character, parameter :: scheme = 'A'; real, parameter :: c3 = 0.0, c2 = 1.0, c1 = 2.0, c0 = -24.0, cc = 6.0
+!character, parameter :: scheme = 'B'; real, parameter :: c3 = 1.0, c2 = 0.0, c1 = 8.0, c0 = -56.0, cc = 12.0
+character, parameter :: scheme = 'C'; real, parameter :: c3 = 1.0, c2 = 3.0, c1 = 14.0, c0 = -128.0, cc = 30.0
 
-! buffers holding variable names, statistics and spectra (on per-frame basis)
-character(12) DVAR(fields+3); real CDF(n+1,fields+3), PSD(ns,fields+3)
+! stencil operators (implemented as preprocessor macros)
+#define RANK0(O) (O(0,0,0))
+#define RANK1(O) (O(-1,0,0) + O(1,0,0) + O(0,-1,0) + O(0,1,0) + O(0,0,-1) + O(0,0,1))
+#define RANK2(O) (O(-1,-1,0) + O(1,-1,0) + O(-1,1,0) + O(1,1,0) + O(-1,0,-1) + O(1,0,-1) + O(-1,0,1) + O(1,0,1) + O(0,-1,-1) + O(0,1,-1) + O(0,-1,1) + O(0,1,1))
+#define RANK3(O) (O(-1,-1,-1) + O(1,-1,-1) + O(-1,1,-1) + O(1,1,-1) + O(-1,-1,1) + O(1,-1,1) + O(-1,1,1) + O(1,1,1))
+#define STENCIL(C,O) ((C ## 0) * RANK0(O) + (C ## 1) * RANK1(O) + (C ## 2) * RANK2(O) + (C ## 3) * RANK3(O))
+
+! parallel-safe vector constructor (... explain this ...)
+#ifndef THREADS
+#define VECTOR(A,B) (/ A, B /)
+#else
+#define VECTOR(A,B) ((A)*(/1,0/) + (B)*(/0,1/))
+#endif
 
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Main code
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-integer l
+integer l, seed(2)
 
-! smp array samples all fields on a 3D grid for three subsequent time slices
+! canonical expansion variables
+real :: q = 1.0, p = -6.0*H0
+
+! buffers holding variable names, statistics and spectra (on per-frame basis)
+character(12) DVAR(fields*2+3); real CDF(n+1,fields*2+3), PSD(ns,fields*2+3)
+
+! allocate global storage for 3D grid variables and FFTs
 ! for larger grids, dynamically allocated array might be required
 #ifndef DYNAMIC_ARRAYS
-real smp(fields,0:p,0:p,0:p,3)
-real(8) tmp(n,n,n), bov(nx,nx,nx)
-complex(8) Fk(nn,n,n)
+real fi(fields,0:m,0:m,0:m), pi(fields,0:m,0:m,0:m), rho(n,n,n), prs(n,n,n)
+real(8) tmp(n,n,n), bov(nx,nx,nx); complex(8) Fk(nn,n,n)
 #else
-real, allocatable :: smp(:,:,:,:,:)
+real, allocatable :: fi(:,:,:,:), pi(:,:,:,:), rho(:,:,:), prs(:,:,:)
 real(8), allocatable :: tmp(:,:,:), bov(:,:,:)
 complex(8), allocatable :: Fk(:,:,:)
-allocate(smp(fields,0:p,0:p,0:p,3), tmp(n,n,n), Fk(nn,n,n))
+
+allocate(fi(fields,0:m,0:m,0:m), pi(fields,0:m,0:m,0:m))
+allocate(tmp(n,n,n), Fk(nn,n,n))
+if (output$rho) allocate(rho(n,n,n))
+if (output$prs) allocate(prs(n,n,n))
 if (output$bov .and. nx /= n) allocate(bov(nx,nx,nx))
 #endif
 
 ! use threaded FFTW on SMP machines (link with -lfftw3_threads)
-#ifdef FFTWTHREADS
-call dfftw_init_threads
-call dfftw_plan_with_nthreads(FFTWTHREADS)
+#ifdef THREADS
+call dfftw_init_threads(l)
+call dfftw_plan_with_nthreads(THREADS)
 #endif
 
-! initialize random number generator
-call random_seed
+! initialize random number generator (use urandom on clusters!)
+open (333, file="/dev/random", action='read', form='binary')
+read (333) seed; call random_seed(PUT=seed); close (333)
 
-! initialize and run simulation
-call head(6, (/"t", "a", "H", "<rho>", "<P>"/))
-call init(smp(:,:,:,:,1), smp(:,:,:,:,2))
+! initialize simulation
+call head(6, (/"t", "a", "H", "<rho>", "<P>", "Omega[T]", "Omega[G]", "Omega[V]", "Omega[K]", "<phi>", "<psi>"/))
+call init(fi, pi); call checkpt(0, fi, pi)
 
-do l = 1,tt,3
-        call step(l,   smp(:,:,:,:,1), smp(:,:,:,:,2), smp(:,:,:,:,3), smp(:,:,:,:,1))
-        call step(l+1, smp(:,:,:,:,2), smp(:,:,:,:,3), smp(:,:,:,:,1), smp(:,:,:,:,2))
-        call step(l+2, smp(:,:,:,:,3), smp(:,:,:,:,1), smp(:,:,:,:,2), smp(:,:,:,:,3))
+! time evolution loop
+do l = 1,tt
+        call si(fi, pi, dt, order); if (mod(l, nt) == 0) call checkpt(l, fi, pi)
 end do
 
 contains
 
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! Compute engine
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 ! periodic boundary conditions
 subroutine wrap(up)
-        real, dimension(fields,0:p,0:p,0:p) :: up
+        real, dimension(fields,0:m,0:m,0:m) :: up
         
         up(:,0,:,:) = up(:,n,:,:); up(:,n+1,:,:) = up(:,1,:,:)
         up(:,:,0,:) = up(:,:,n,:); up(:,:,n+1,:) = up(:,:,1,:)
@@ -136,136 +184,241 @@ subroutine wrap(up)
 end subroutine wrap
 
 ! scalar field initial conditions
-subroutine init(dn, hr)
-        real, dimension(fields,0:p,0:p,0:p) :: dn, hr
+subroutine init(fi, pi)
+        real, dimension(fields,0:m,0:m,0:m) :: fi, pi
         
-        real, parameter :: m2phi$eff = m2phi - 2.25*H0**2
-        real, parameter :: m2psi$eff = m2psi + g2*phi0**2 - 2.25*H0**2
+        ! effective mass of the field fluctuations
+        real, parameter :: m2phi$eff = 3.0*lambda*phi0**2
+        real, parameter :: m2psi$eff = g2*phi0**2
         
-        call sample(tmp, -0.25, m2phi$eff); hr(phi,1:n,1:n,1:n) = tmp + phi0
-        call sample(tmp, -0.25, m2psi$eff); hr(psi,1:n,1:n,1:n) = tmp
+        ! initialize simulation volume
+        call sample(1, tmp, m2phi$eff, H0, phi0); fi(phi,1:n,1:n,1:n) = tmp
+        call sample(1, tmp, m2psi$eff, H0      ); fi(psi,1:n,1:n,1:n) = tmp
         
-        call sample(tmp, +0.25, m2phi$eff); dn(phi,1:n,1:n,1:n) = hr(phi,1:n,1:n,1:n) - tmp*dt - dphi0*dt + ddphi0*dt**2/2.0
-        call sample(tmp, +0.25, m2psi$eff); dn(psi,1:n,1:n,1:n) = hr(psi,1:n,1:n,1:n) - tmp*dt
-        
-        call wrap(dn); call wrap(hr)
+        call sample(2, tmp, m2phi$eff, H0, dphi0); pi(phi,1:n,1:n,1:n) = tmp
+        call sample(2, tmp, m2psi$eff, H0       ); pi(psi,1:n,1:n,1:n) = tmp
 end subroutine init
 
-! stencil operators (implemented as preprocessor macros)
-#define HR(x,y,z) hr(:,i+(x),j+(y),k+(z))
-#define GRAD2(x,y,z) sum((hr(:,i+(x),j+(y),k+(z))-hr(:,i,j,k))**2)
+! split Hamiltonian evolution - field advance step
+subroutine fstep(fi, pi, dt, fuse)
+        real, dimension(fields,0:m,0:m,0:m) :: fi, pi; real dt
+        real, save :: d = 0.0; logical, optional :: fuse
+        
+        ! accumulate step
+        d = d + dt/q**2
+        
+        ! advance fields (if needed)
+        if (present(fuse) .and. fuse) return
+        if (d /= 0.0) fi = fi + d*pi
+        call wrap(fi); d = 0.0
+end subroutine fstep
 
-#define RANK0(O) (O(0,0,0))
-#define RANK1(O) (O(-1,0,0) + O(1,0,0) + O(0,-1,0) + O(0,1,0) + O(0,0,-1) + O(0,0,1))
-#define RANK2(O) (O(-1,-1,0) + O(1,-1,0) + O(-1,1,0) + O(1,1,0) + O(-1,0,-1) + O(1,0,-1) + O(-1,0,1) + O(1,0,1) + O(0,-1,-1) + O(0,1,-1) + O(0,-1,1) + O(0,1,1))
-#define RANK3(O) (O(-1,-1,-1) + O(1,-1,-1) + O(-1,1,-1) + O(1,1,-1) + O(-1,-1,1) + O(1,-1,1) + O(-1,1,1) + O(1,1,1))
-#define STENCIL(C,O) ((C ## 0) * RANK0(O) + (C ## 1) * RANK1(O) + (C ## 2) * RANK2(O) + (C ## 3) * RANK3(O))
-
-! scalar field evolution step
-subroutine step(l, dn, hr, up, pp)
-        real, dimension(fields,0:p,0:p,0:p) :: dn, hr, up, pp; integer i, j, k, l
-        
-        ! Laplacian operator stencils: traditional one and three isotropic variants
-        ! stable for dx/dt > sqrt(3), sqrt(2), sqrt(21)/3, and 8/sqrt(30) respectively
-        ! computational cost difference is insignificant for large grids
-        
-        !real, parameter :: c3 = 0.0, c2 = 0.0, c1 = 1.0, c0 = -6.0, cc = 1.0
-        !real, parameter :: c3 = 0.0, c2 = 1.0, c1 = 2.0, c0 = -24.0, cc = 6.0
-        !real, parameter :: c3 = 1.0, c2 = 0.0, c1 = 8.0, c0 = -56.0, cc = 12.0
-        real, parameter :: c3 = 1.0, c2 = 3.0, c1 = 14.0, c0 = -128.0, cc = 30.0
-        
-        ! basis vectors for vectorizing potential derivative
-        real, dimension(fields), parameter :: V1 = (/1,0/), V2 = (/0,1/)
-        
-        ! field energy (distributed for parallelization)
-        real, dimension(n) :: V, T, G, PE, KE, GE
-        
-        ! various evolution operator coefficients
-        real c, d, b0, b1, b2, b3, d1, d2, e1, e2, e3
-        
-        ! optional computations flags
-        logical, parameter :: dumping = output .and. (output$bov .or. output$crv)
-        logical, parameter :: needTii = dumping .and. (output$set .or. output$pot)
-        logical checkpt; integer db, idx
-        
-        ! flat or expanding background
-        !real, parameter :: a = 1.0, H = 0.0; real Q
-        real a, H, Q, R; a = LA(2); H = 1.0/LH(2)
+! split Hamiltonian evolution - momenta advance step
+subroutine pstep(fi, pi, dt)
+#define FI(x,y,z) fi(:,i+(x),j+(y),k+(z))
+        real, dimension(fields,0:m,0:m,0:m) :: fi, pi; real dt; integer i, j, k
+        real, dimension(n) :: T, G, V; real, dimension(fields, n) :: DD, DV
+        real a, b, b0, b1, b2, b3, d
         
         ! all coefficients inside the loop are pre-calculated here
-        d = 1.0 + 1.5*H*dt; c = cc * alpha**2 * a**2 * d
-        b0 = 2.0/d + c0/c; b1 = c1/c; b2 = c2/c; b3 = c3/c
-        d1 = -(1.0 - 1.5*H*dt)/d; d2 = -dt**2/d
-        e1 = 1.0/(8.0*dt**2); e2 = 1.0/(4.0*(a*dx)**2*cc); e3 = e2/3.0
+        a = q; b = dt/cc * (a/dx)**2; d = a**4 * dt
+        b0 = b*c0; b1 = b*c1; b2 = b*c2; b3 = b*c3;
         
         ! initialize accumulators
-        PE = 0.0; KE = 0.0; GE = 0.0
-        checkpt = mod(l-1, nt) == 0
-        db = 0; idx = 0
+        T = 0.0; G = 0.0; V = 0.0
         
-        ! discretized scalar field evolution step
         !$omp parallel do
         do k = 1,n; do j = 1,n; do i = 1,n
-                ! scalar field potential derivatives are inlined here
-                up(:,i,j,k) = STENCIL(b,HR) + d1 * dn(:,i,j,k) + &
-                    d2 * ( (m2phi + g2*hr(psi,i,j,k)**2)*V1 + (m2psi + g2*hr(phi,i,j,k)**2)*V2 ) * hr(:,i,j,k)
+                ! laplacian operator and scalar field potential derivatives
+                DD(:,k) = STENCIL(b,FI)
+                DV(:,k) = M2I(fi(phi,i,j,k),fi(psi,i,j,k)) * fi(:,i,j,k)
                 
-                ! scalar field potential multiplied by 2 is inlined here
-                V(k) = (m2phi + g2*hr(psi,i,j,k)**2)*hr(phi,i,j,k)**2 + m2psi*hr(psi,i,j,k)**2
-                T(k) = sum((up(:,i,j,k)-dn(:,i,j,k))**2)
+                ! accumulate field energy (pass 1)
+                T(k) = T(k) + sum(pi(:,i,j,k)**2)
+                G(k) = G(k) + sum(fi(:,i,j,k)*DD(:,k))
                 
-                PE(k) = PE(k) + V(k); KE(k) = KE(k) + T(k)
+                ! advance field momenta
+                pi(:,i,j,k) = pi(:,i,j,k) + DD(:,k) - d * DV(:,k)
                 
-                ! calculate density and pressure when needed
-                if (checkpt) then
-                        G(k) = STENCIL(c,GRAD2); GE(k) = GE(k) + G(k)
-                        
-                        if (needTii) then
-                                pp(rho,i,j,k) = e1*T(k) + e2*G(k) + 0.5*V(k)
-                                pp(prs,i,j,k) = e1*T(k) - e3*G(k) - 0.5*V(k)
-                        end if
-                end if
+                ! accumulate field energy (pass 2)
+                V(k) = V(k) + Vx4(fi(phi,i,j,k),fi(psi,i,j,k))
+                T(k) = T(k) + sum(pi(:,i,j,k)**2)
         end do; end do; end do
         
-        ! periodic boundary conditions
-        call wrap(up)
+        ! reduce accumulated values and advance expansion rate
+        p = p + sum(T)/(a*n)**3 * (dt/2.0) + sum(G)/(a*n**3) - sum(V)*(a/n)**3 * dt
+end subroutine pstep
+
+! split Hamiltonian evolution - logging step
+subroutine lstep(fi, pi, time, flatten, need$rho, need$prs)
+#define G2(x,y,z) (fi(:,i+(x),j+(y),k+(z))-fi(:,i,j,k))**2
+        real, dimension(fields,0:m,0:m,0:m) :: fi, pi; real time
+        logical flatten, need$rho, need$prs; integer i, j, k
+        real, dimension(n) :: T, G, V, KA, GA, PA
+        real FA(fields,n), F(fields), KE, GE, PE, RE
+        real a, H, e1, e2, e3, e4
         
-        ! update expansion factors
-        Q = sum(4.0*e1*KE - PE)/(6.0*n**3)
-        R = LH(1) + (1.0 + Q * LH(2)**2) * dt
-        LH = (/ LH(2), LH(1) + (1.0 + Q * R**2) * (2.0*dt) /)
-        LA = (/ LA(2), LA(1) + (H*a) * (2.0*dt) /)
+        ! update fields to current time
+        call fstep(fi, pi, 0.0); a = q
         
-        ! dump simulation data
-        if (checkpt) then
-                write (*,'(5g)') (l-1)*dt, a, H, sum(e1*KE + e2*GE + 0.5*PE)/n**3, sum(e1*KE - e3*GE - 0.5*PE)/n**3
+        ! all coefficients inside the loop are pre-calculated here
+        e1 = 1.0/(2.0*a**4); e2 = 1.0/(4.0*cc*dx**2); e3 = e2/3.0; e4 = a**2/4.0
+        
+        ! initialize accumulators
+        KA = 0.0; GA = 0.0; PA = 0.0; FA = 0.0
+        
+        !$omp parallel do
+        do k = 1,n; do j = 1,n; do i = 1,n
+                G(k) = sum(STENCIL(c,G2))
+                T(k) = sum(pi(:,i,j,k)**2)
+                V(k) = Vx4(fi(phi,i,j,k),fi(psi,i,j,k))
                 
-                if (dumping .and. output$any) db = fopen("frame", (l-1)/nt, (l-1)*dt)
-                if (dumping .and. output$fld) then
-                        Q = 1.0; if (oscale) Q = a**1.5
-                        tmp = Q*hr(phi,1:n,1:n,1:n); call dump(db, "phi", (l-1)/nt, (l-1)*dt, tmp, idx)
-                        tmp = Q*hr(psi,1:n,1:n,1:n); call dump(db, "psi", (l-1)/nt, (l-1)*dt, tmp, idx)
-                end if
-                if (dumping .and. output$set) then
-                        Q = 1.0; if (oscale) Q = 1.0/(3.0*H**2)
-                        tmp = Q*pp(rho,1:n,1:n,1:n); call dump(db, "rho", (l-1)/nt, (l-1)*dt, tmp, idx)
-                        tmp = Q*pp(prs,1:n,1:n,1:n); call dump(db, "prs", (l-1)/nt, (l-1)*dt, tmp, idx)
-                end if
-                if (dumping .and. output$pot) then
-                        Q = a**2/2.0; tmp = Q*pp(rho,1:n,1:n,1:n)
-                        call laplace(tmp, tmp); call dump(db, "PSI", (l-1)/nt, (l-1)*dt, tmp, idx)
-                end if
-                if (idx > 0 .and. output$gnu) call fflush((l-1)*dt, idx)
-                if (db /= 0) call fclose(db)
+                FA(:,k) = FA(:,k) + fi(:,i,j,k)
+                
+                KA(k) = KA(k) + T(k)
+                GA(k) = GA(k) + G(k)
+                PA(k) = PA(k) + V(k)
+                
+                if (need$rho) rho(i,j,k) = e1*T(k) + e2*G(k) + e4*V(k)
+                if (need$prs) prs(i,j,k) = e1*T(k) - e3*G(k) - e4*V(k)
+        end do; end do; end do
+        
+        ! reduce accumulated values
+        KE = e1*sum(KA)/n**3
+        GE = e2*sum(GA)/n**3
+        PE = e4*sum(PA)/n**3
+        
+        ! reset expansion rate to enforce flatness
+        if (flatten) p = -sqrt(12.0*(KE+GE+PE))/a
+        H = -p/(6.0*a); RE = KE+GE+PE-3.0*H**2
+        
+        forall (i=1:fields) F(i) = sum(FA(i,:))/n**3
+        
+        ! log expansion history and diagnostics to stdout
+        write (*,'(32g)') time, a, H, KE+GE+PE, KE-GE/3.0-PE, (/KE, GE, PE, RE/)/(3.0*H**2), a*F
+end subroutine lstep
+
+! scalar field evolution checkpoint
+subroutine checkpt(l, fi, pi)
+        real, dimension(fields,0:m,0:m,0:m) :: fi, pi; integer i, j, k, l, db, idx; real a, H, s
+        
+        ! optional computations flags
+        logical, parameter :: dumping = output .and. (output$bov .or. output$crv) .and. &
+                (output$fld .or. output$vel .or. output$rho .or. output$prs .or. output$pot)
+        logical, parameter :: need$rho = dumping .and. (output$rho .or. output$pot)
+        logical, parameter :: need$prs = dumping .and. output$prs
+        
+        ! prepare to log (flatten initial slice only!)
+        call lstep(fi, pi, l*dt, l==0, need$rho, need$prs); a = q; H = -p/(6.0*a)
+        
+        ! dump requested variables
+        db = 0; idx = 0
+        if (dumping) db = fopen("frame", l/nt, l*dt)
+        if (dumping .and. output$fld) then
+                s = 1.0; if (oscale) s = a
+                tmp = s*fi(phi,1:n,1:n,1:n); call dump(db, "phi", l/nt, l*dt, tmp, idx)
+                tmp = s*fi(psi,1:n,1:n,1:n); call dump(db, "psi", l/nt, l*dt, tmp, idx)
         end if
-end subroutine step
+        if (dumping .and. output$vel) then
+                s = 1.0/a**2; if (oscale) s = 1.0/a
+                tmp = s*pi(phi,1:n,1:n,1:n); call dump(db, "dphi", l/nt, l*dt, tmp, idx)
+                tmp = s*pi(psi,1:n,1:n,1:n); call dump(db, "dpsi", l/nt, l*dt, tmp, idx)
+        end if
+        if (dumping .and. output$rho) then
+                s = 1.0; if (oscale) s = 1.0/(3.0*H**2); tmp = s*rho
+                call dump(db, "rho", l/nt, l*dt, tmp, idx)
+        end if
+        if (dumping .and. output$prs) then
+                s = 1.0; if (oscale) s = 1.0/(3.0*H**2); tmp = s*prs
+                call dump(db, "prs", l/nt, l*dt, tmp, idx)
+        end if
+        if (dumping .and. output$pot) then
+                tmp = 0.5*rho; call laplace(tmp, tmp)
+                call dump(db, "PSI", l/nt, l*dt, tmp, idx)
+        end if
+        if (idx > 0 .and. output$gnu) call fflush(l*dt, idx)
+        if (db /= 0) call fclose(db)
+end subroutine checkpt
 
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-! sample Gaussian random field with power-law spectrum
-subroutine sample(f, gamma, m2eff)
-        real(8) f(n,n,n); real gamma, m2eff; integer(8) plan
+! second order symplectic integrator
+subroutine si2(fi, pi, dt)
+        real, dimension(fields,0:m,0:m,0:m) :: fi, pi; real dt
+        
+        q = q - p * (dt/12.0)
+        call fstep(fi, pi, dt/2.0)
+        call pstep(fi, pi, dt    )
+        call fstep(fi, pi, dt/2.0, fuse=.true.)
+        q = q - p * (dt/12.0)
+end subroutine si2
+
+! 6-th order symplectic integrator of Yoshida (scheme A)
+subroutine si6(fi, pi, dt)
+        real, dimension(fields,0:m,0:m,0:m) :: fi, pi; real dt; integer i
+        
+        do i = -3,3; call si2(fi, pi, W6A(abs(i))*dt); end do
+end subroutine si6
+
+! k-th order recursive symplectic integrator (k should be even)
+recursive subroutine si(fi, pi, dt, k)
+        real, dimension(fields,0:m,0:m,0:m) :: fi, pi; real dt, gamma, w1, w0; integer k
+        
+        select case (k)
+                case (2); call si2(fi, pi, dt)
+                case (6); call si6(fi, pi, dt)
+                case default
+                        gamma = 1.0/(k-1); w1 = 1.0/(2.0 - 2.0**gamma); w0 = 1.0 - 2.0*w1
+                        
+                        call si(fi, pi, w1*dt, k-2)
+                        call si(fi, pi, w0*dt, k-2)
+                        call si(fi, pi, w1*dt, k-2)
+        end select
+end subroutine si
+
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+! integrate modulus of a Hankel function w(x) = sqrt(pi/2x) |H_nu(x)|
+! w(x) satisfies ODE w'' + (1+mu/x^2) w = 1/w^3, with mu = 1/4-nu^2
+! see http://dlmf.nist.gov/10.18 for details and asymptotic expansion
+function hankelw(y, mu, x, kind)
+        real hankelw, y(3), mu, x, z, u, v, w, delta, dz; integer i, j, s, kind
+        
+        ! initialize based on asymptotic expansion at large x
+        if (all(y == 0.0)) then
+                z = 1.0/x
+                w = sqrt(1.0 - (mu/2.0)*z**2)
+                u = z*w; v = (1.0 - mu*z**2)/w
+        else
+                z = y(1); u = y(2); v = y(3)
+        end if
+        
+        ! estimate number of steps needed to achive target accuracy
+        delta = 1.0/x-z; s = 1 + int(abs(delta)/0.01); delta = delta/s
+        
+        ! take a sequence of leapfrog steps, 6th order schedule
+        do j=1,s; do i = -3,3; dz = W6A(abs(i))/2.0 * delta
+                z = z + dz; u = u + v * dz
+                v = v + (1.0/u**3 - (1.0/z**2 + mu) * u/z**2) * (2.0*dz)
+                z = z + dz; u = u + v * dz
+        end do; end do
+        
+        ! field and velocity correction factors
+        select case (kind)
+                case(1); w = u/z
+                case(2); w = sqrt((z*v - 2.0*u)**2 + (z/u)**2)
+        end select
+        
+        ! pack dynamical system state and return
+        y = (/z, u, v/); hankelw = w
+end function hankelw
+
+! sample Gaussian random field with specified spectrum
+subroutine sample(kind, f, m2eff, H0, f0)
+        real(8) f(n,n,n); integer(8) plan
+        integer, value :: kind; real m2eff, H0; real, optional :: f0
         
         integer, parameter :: os = 16, nos = n * os**2
         real, parameter :: dxos = dx/os, dkos = dk/(2*os), kcut = nn*dk/2.0
@@ -273,13 +426,31 @@ subroutine sample(f, gamma, m2eff)
         complex, parameter :: w = (0.0, twopi)
         
         real(8) ker(nos); real a(nn), p(nn)
-        integer i, j, k, l; real kk
+        integer i, j, k, l; real kk, mu, y(3); y = 0.0
         
-        ! calculate (oversampled) radial profile of convolution kernel
-        do k = 1,nos; kk = (k-0.5)*dkos
-                ker(k) = kk*(kk**2 + m2eff)**gamma * exp(-(kk/kcut)**2)
+        ! vacuum state selection
+        if (kind < 3 .and. H0 == 0.0) kind = kind + 2
+        select case (kind)
+                case (1:2); mu = m2eff/H0**2 - 2.0
+                case (3:4); mu = m2eff - 2.25*H0**2
+        end select
+        
+        ! initial fluctuations spectrum
+        do k = nos,1,-1; kk = (k-0.5)*dkos
+                select case (kind)
+                        ! de Sitter vacuum
+                        case(1); ker(k) = hankelw(y, mu, kk/H0, 1)/sqrt(kk)
+                        case(2); ker(k) = hankelw(y, mu, kk/H0, 2)*sqrt(kk)
+                        ! Minkowski vacuum
+                        case(3); ker(k) = (mu + kk**2)**(-0.25)
+                        case(4); ker(k) = (mu + kk**2)**(+0.25)
+                end select
+                
+                ! cutoff is necessary for stability
+                ker(k) = kk*ker(k) * exp(-(kk/kcut)**2)
         end do
         
+        ! calculate (oversampled) radial profile of convolution kernel
         call dfftw_plan_r2r_1d(plan,nos,ker,ker,FFTW_RODFT10,FFTW_ESTIMATE)
         call dfftw_execute(plan); call dfftw_destroy_plan(plan)
         
@@ -307,6 +478,9 @@ subroutine sample(f, gamma, m2eff)
                 Fk(:,j,k) = sqrt(-2.0*log(a)) * exp(w*p) * Fk(:,j,k)
         end do; end do
         
+        ! override zero mode if requested
+        if (present(f0)) Fk(1,1,1) = f0
+        
         call dfftw_plan_dft_c2r_3d(plan,n,n,n,Fk,f,FFTW_ESTIMATE)
         call dfftw_execute(plan); call dfftw_destroy_plan(plan)
 end subroutine sample
@@ -316,17 +490,8 @@ subroutine laplace(f, rho)
         real(8) f(n,n,n), rho(n,n,n); integer(8) plan
         integer i, j, k; real :: ii, jj, kk
         
-        real, parameter :: w = twopi/n
-        
-        ! Laplacian operator stencils: traditional one and three isotropic variants
-        ! (corresponding to discretization used for field evolution equations above)
-        
-        !real, parameter :: c3 = 0.0, c2 = 0.0, c1 = 1.0, c0 = -3.0, cc = 0.5
-        !real, parameter :: c3 = 0.0, c2 = 1.0, c1 = 1.0, c0 = -6.0, cc = 1.5
-        !real, parameter :: c3 = 1.0, c2 = 0.0, c1 = 2.0, c0 = -7.0, cc = 1.5
-        real, parameter :: c3 = 2.0, c2 = 3.0, c1 = 7.0, c0 = -32.0, cc = 7.5
-        
-        real, parameter :: c = cc * dx**2/real(n)**3
+        real, parameter :: w = twopi/n, b = cc * dx**2/real(n)**3
+        real, parameter :: b3 = 8.0*c3, b2 = 4.0*c2, b1 = 2.0*c1, b0 = c0
         
         call dfftw_plan_dft_r2c_3d(plan,n,n,n,rho,Fk,FFTW_ESTIMATE)
         call dfftw_execute(plan); call dfftw_destroy_plan(plan)
@@ -335,7 +500,7 @@ subroutine laplace(f, rho)
         do k = 1, n; kk = cos(w*(k-1))
         do j = 1, n; jj = cos(w*(j-1))
         do i = 1,nn; ii = cos(w*(i-1))
-                Fk(i,j,k) = c*Fk(i,j,k)/(c0 + c1*(ii+jj+kk) + c2*(ii*jj+ii*kk+jj*kk) + c3*ii*jj*kk)
+                Fk(i,j,k) = b*Fk(i,j,k)/(b0 + b1*(ii+jj+kk) + b2*(ii*jj+ii*kk+jj*kk) + b3*ii*jj*kk)
         end do; end do; end do
         
         Fk(1,1,1) = 0.0
@@ -368,9 +533,6 @@ subroutine spectrum(f, S)
         where (W /= 0.0) S = S/W/real(n)**6
 end subroutine spectrum
 
-
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
 ! partially sort an array, finding (r:n:m)th smallest elements
 recursive subroutine sieve(f, n, m, r)
         integer i, j, k, n, m, r; real(8) p, f(n)
@@ -399,12 +561,14 @@ end subroutine sieve
 
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+! I/O Backend
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 ! identify yourself
 subroutine head(fd, vars)
         integer(4) fd; character(*) :: vars(:)
         character(512) :: buffer; integer a, b, c, l
-        character(*), parameter :: rev = "$Revision: 2.1 $"
+        character(*), parameter :: rev = "$Revision: 3.0 $"
         
         ! behold the horror that is Fortran string parsing
         a = index(rev, ": ") + 2
@@ -414,13 +578,11 @@ subroutine head(fd, vars)
         buffer = rev(b+1:c); read (buffer, '(i)') b
         
         ! ID string
-        write (fd,'(g,4(i0,g))') "# This is DEFROST revision ", a-1, ".", b, " (", fields, " fields, ", n, "^3 grid)"
+        write (fd,'(g,5(i0,g))') "# This is DEFROST revision ", a-1, ".", b, " (", fields, " fields, ", n, "^3 grid, ", tt, " steps)"
+        write (fd,'(g,i0,g,g)') "# ", order, "-th order symplectic integrator, Laplacian discretization ", scheme
         
         ! model summary
-        write (fd,'(g,3(f0.5,g))') "# V(phi,psi) = ", &
-                sqrt(m2phi), "^2*phi^2/2 + ",         &
-                sqrt(m2psi), "^2*psi^2/2 + ",         &
-                sqrt(g2), "^2*phi^2*psi^2/2"
+        write (fd,'(g,4(f0.5,g))') VTAG
         
         ! variable list
         write (buffer,'(g,g12.12",",32(g24.12","))') "OUTPUT:", adjustr(vars); l = index(buffer, ',', .true.);
