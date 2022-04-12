@@ -66,7 +66,6 @@ integer, parameter :: nx = n/2                  ! spatial grid is downsampled to
 integer, parameter :: nt = 2**4                 ! simulation will be logged every nt time steps
 
 logical, parameter :: output = .true.           ! set this to false to disable all file output at once
-logical, parameter :: oscale = .true.           ! scale output variables to counter-act expansion
 
 logical, parameter :: output$bov = .false.      ! output 3D data cube (storage-expensive)
 logical, parameter :: output$psd = .true.       ! output power spectra (time-expensive)
@@ -123,10 +122,7 @@ character, parameter :: scheme = 'C'; real, parameter :: c3 = 1.0, c2 = 3.0, c1 
 ! Main code
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-integer l, seed(2)
-
-! canonical expansion variables
-real :: q = 1.0, p = -6.0*H0
+integer l, seed(2); real E0
 
 ! buffers holding variable names, statistics and spectra (on per-frame basis)
 character(12) DVAR(fields*2+3); real CDF(n+1,fields*2+3), PSD(ns,fields*2+3)
@@ -159,7 +155,7 @@ open (333, file="/dev/random", action='read', form='binary')
 read (333) seed; call random_seed(PUT=seed); close (333)
 
 ! initialize simulation
-call head(6, (/"t", "a", "H", "<rho>", "<P>", "Omega[T]", "Omega[G]", "Omega[V]", "Omega[K]", "<phi>", "<psi>"/))
+call head(6, (/"t", "<rho>", "<P>", "Omega[T]", "Omega[G]", "Omega[V]", "<phi>", "<psi>", "Delta[E]"/))
 call init(fi, pi); call checkpt(0, fi, pi)
 
 ! time evolution loop
@@ -205,7 +201,7 @@ subroutine fstep(fi, pi, dt, fuse)
         real, save :: d = 0.0; logical, optional :: fuse
         
         ! accumulate step
-        d = d + dt/q**2
+        d = d + dt
         
         ! advance fields (if needed)
         if (present(fuse) .and. fuse) return
@@ -218,11 +214,10 @@ subroutine pstep(fi, pi, dt)
 #define FI(x,y,z) fi(:,i+(x),j+(y),k+(z))
         real, dimension(fields,0:m,0:m,0:m) :: fi, pi; real dt; integer i, j, k
         real, dimension(n) :: T, G, V; real, dimension(fields, n) :: DD, DV
-        real a, b, b0, b1, b2, b3, d
+        real b, b0, b1, b2, b3, d
         
         ! all coefficients inside the loop are pre-calculated here
-        a = q; b = dt/cc * (a/dx)**2; d = a**4 * dt
-        b0 = b*c0; b1 = b*c1; b2 = b*c2; b3 = b*c3;
+        b = dt/dx**2/cc; b0 = b*c0; b1 = b*c1; b2 = b*c2; b3 = b*c3;
         
         ! initialize accumulators
         T = 0.0; G = 0.0; V = 0.0
@@ -233,20 +228,9 @@ subroutine pstep(fi, pi, dt)
                 DD(:,k) = STENCIL(b,FI)
                 DV(:,k) = M2I(fi(phi,i,j,k),fi(psi,i,j,k)) * fi(:,i,j,k)
                 
-                ! accumulate field energy (pass 1)
-                T(k) = T(k) + sum(pi(:,i,j,k)**2)
-                G(k) = G(k) + sum(fi(:,i,j,k)*DD(:,k))
-                
                 ! advance field momenta
-                pi(:,i,j,k) = pi(:,i,j,k) + DD(:,k) - d * DV(:,k)
-                
-                ! accumulate field energy (pass 2)
-                V(k) = V(k) + Vx4(fi(phi,i,j,k),fi(psi,i,j,k))
-                T(k) = T(k) + sum(pi(:,i,j,k)**2)
+                pi(:,i,j,k) = pi(:,i,j,k) + DD(:,k) - dt * DV(:,k)
         end do; end do; end do
-        
-        ! reduce accumulated values and advance expansion rate
-        p = p + sum(T)/(a*n)**3 * (dt/2.0) + sum(G)/(a*n**3) - sum(V)*(a/n)**3 * dt
 end subroutine pstep
 
 ! split Hamiltonian evolution - logging step
@@ -256,13 +240,12 @@ subroutine lstep(fi, pi, time, flatten, need$rho, need$prs)
         logical flatten, need$rho, need$prs; integer i, j, k
         real, dimension(n) :: T, G, V, KA, GA, PA
         real FA(fields,n), F(fields), KE, GE, PE, RE
-        real a, H, e1, e2, e3, e4
+
+        ! all coefficients inside the loop are pre-calculated here
+        real, parameter :: e1 = 1.0/2.0, e2 = 1.0/(4.0*cc*dx**2), e3 = e2/3.0, e4 = 1.0/4.0
         
         ! update fields to current time
-        call fstep(fi, pi, 0.0); a = q
-        
-        ! all coefficients inside the loop are pre-calculated here
-        e1 = 1.0/(2.0*a**4); e2 = 1.0/(4.0*cc*dx**2); e3 = e2/3.0; e4 = a**2/4.0
+        call fstep(fi, pi, 0.0)
         
         ! initialize accumulators
         KA = 0.0; GA = 0.0; PA = 0.0; FA = 0.0
@@ -288,19 +271,17 @@ subroutine lstep(fi, pi, time, flatten, need$rho, need$prs)
         GE = e2*sum(GA)/n**3
         PE = e4*sum(PA)/n**3
         
-        ! reset expansion rate to enforce flatness
-        if (flatten) p = -sqrt(12.0*(KE+GE+PE))/a
-        H = -p/(6.0*a); RE = KE+GE+PE-3.0*H**2
+        RE = KE+GE+PE; if (flatten) E0 = RE
         
         forall (i=1:fields) F(i) = sum(FA(i,:))/n**3
         
         ! log expansion history and diagnostics to stdout
-        write (*,'(32g)') time, a, H, KE+GE+PE, KE-GE/3.0-PE, (/KE, GE, PE, RE/)/(3.0*H**2), a*F
+        write (*,'(32g)') time, KE+GE+PE, KE-GE/3.0-PE, (/KE, GE, PE/)/RE, F, (RE-E0)/E0
 end subroutine lstep
 
 ! scalar field evolution checkpoint
 subroutine checkpt(l, fi, pi)
-        real, dimension(fields,0:m,0:m,0:m) :: fi, pi; integer i, j, k, l, db, idx; real a, H, s
+        real, dimension(fields,0:m,0:m,0:m) :: fi, pi; integer i, j, k, l, db, idx
         
         ! optional computations flags
         logical, parameter :: dumping = output .and. (output$bov .or. output$crv) .and. &
@@ -309,28 +290,24 @@ subroutine checkpt(l, fi, pi)
         logical, parameter :: need$prs = dumping .and. output$prs
         
         ! prepare to log (flatten initial slice only!)
-        call lstep(fi, pi, l*dt, l==0, need$rho, need$prs); a = q; H = -p/(6.0*a)
+        call lstep(fi, pi, l*dt, l==0, need$rho, need$prs)
         
         ! dump requested variables
         db = 0; idx = 0
         if (dumping) db = fopen("frame", l/nt, l*dt)
         if (dumping .and. output$fld) then
-                s = 1.0; if (oscale) s = a
-                tmp = s*fi(phi,1:n,1:n,1:n); call dump(db, "phi", l/nt, l*dt, tmp, idx)
-                tmp = s*fi(psi,1:n,1:n,1:n); call dump(db, "psi", l/nt, l*dt, tmp, idx)
+                tmp = fi(phi,1:n,1:n,1:n); call dump(db, "phi", l/nt, l*dt, tmp, idx)
+                tmp = fi(psi,1:n,1:n,1:n); call dump(db, "psi", l/nt, l*dt, tmp, idx)
         end if
         if (dumping .and. output$vel) then
-                s = 1.0/a**2; if (oscale) s = 1.0/a
-                tmp = s*pi(phi,1:n,1:n,1:n); call dump(db, "dphi", l/nt, l*dt, tmp, idx)
-                tmp = s*pi(psi,1:n,1:n,1:n); call dump(db, "dpsi", l/nt, l*dt, tmp, idx)
+                tmp = pi(phi,1:n,1:n,1:n); call dump(db, "dphi", l/nt, l*dt, tmp, idx)
+                tmp = pi(psi,1:n,1:n,1:n); call dump(db, "dpsi", l/nt, l*dt, tmp, idx)
         end if
         if (dumping .and. output$rho) then
-                s = 1.0; if (oscale) s = 1.0/(3.0*H**2); tmp = s*rho
-                call dump(db, "rho", l/nt, l*dt, tmp, idx)
+                tmp = rho; call dump(db, "rho", l/nt, l*dt, tmp, idx)
         end if
         if (dumping .and. output$prs) then
-                s = 1.0; if (oscale) s = 1.0/(3.0*H**2); tmp = s*prs
-                call dump(db, "prs", l/nt, l*dt, tmp, idx)
+                tmp = prs; call dump(db, "prs", l/nt, l*dt, tmp, idx)
         end if
         if (dumping .and. output$pot) then
                 tmp = 0.5*rho; call laplace(tmp, tmp)
@@ -347,11 +324,9 @@ end subroutine checkpt
 subroutine si2(fi, pi, dt)
         real, dimension(fields,0:m,0:m,0:m) :: fi, pi; real dt
         
-        q = q - p * (dt/12.0)
         call fstep(fi, pi, dt/2.0)
         call pstep(fi, pi, dt    )
         call fstep(fi, pi, dt/2.0, fuse=.true.)
-        q = q - p * (dt/12.0)
 end subroutine si2
 
 ! 6-th order symplectic integrator of Yoshida (scheme A)
@@ -709,11 +684,11 @@ subroutine dump(db, v, frame, t, f, idx)
                 if (output$cdf) then
                         call sieve(f, n**3, n**2, 1)
                         C(1:n) = f(1,1,:); C(n+1) = maxval(f(:,:,n)); if (present(idx)) CDF(:,idx) = C
-                        PDF = 0.0; do k = 2,n; PDF(k) = (2.0/n)/(C(k+1)-C(k-1)); end do; if (oscale) PDF = PDF/maxval(PDF)
+                        PDF = 0.0; do k = 2,n; PDF(k) = (2.0/n)/(C(k+1)-C(k-1)); end do; PDF = PDF/maxval(PDF)
                         
                         ! this really should be replaced by a most likelihood fit of a gaussian distribution
                         avg = sum(C(2:n))/(n-1); var = sum((C(2:n)-avg)**2)/(n-2); X = (C-avg)/sqrt(2.0*var)
-                        Y = (1.0 + erf(X))/2.0; Z = exp(-X**2); if (.not. oscale) Z = Z/sqrt(twopi*var)
+                        Y = (1.0 + erf(X))/2.0; Z = exp(-X**2); Z = Z/sqrt(twopi*var)
                         
                         if (output$vis) then
 #ifdef SILO
